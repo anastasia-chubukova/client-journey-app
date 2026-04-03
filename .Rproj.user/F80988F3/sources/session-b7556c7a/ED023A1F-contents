@@ -1,0 +1,1943 @@
+library(shiny)
+library(readr)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(DT)
+library(networkD3)
+library(ggplot2)
+library(purrr)
+library(shinymanager)
+
+options(shiny.maxRequestSize = 500 * 1024^2)
+
+guess_delim <- function(path) {
+  first_line <- readLines(path, n = 1, warn = FALSE, encoding = "UTF-8")
+  first_line <- iconv(first_line, from = "", to = "UTF-8", sub = "")
+  if (is.na(first_line) || length(first_line) == 0) return(",")
+  if (str_count(first_line, ";") > str_count(first_line, ",")) ";" else ","
+}
+
+credentials <- data.frame(
+  user = c("client1", "client2", "admin"),
+  password = c("pass123", "pass456", "admin789"),
+  admin = c(FALSE, FALSE, TRUE),
+  stringsAsFactors = FALSE
+)
+
+read_input_data <- function(path) {
+  ext <- tolower(tools::file_ext(path))
+  
+  df <- tryCatch({
+    if (ext %in% c("csv", "txt")) {
+      delim <- guess_delim(path)
+      
+      tryCatch(
+        read_delim(
+          path,
+          delim = delim,
+          show_col_types = FALSE,
+          progress = FALSE,
+          locale = locale(encoding = "UTF-8")
+        ),
+        error = function(e) {
+          read_delim(
+            path,
+            delim = delim,
+            show_col_types = FALSE,
+            progress = FALSE,
+            locale = locale(encoding = "CP1251")
+          )
+        }
+      )
+    } else if (ext %in% c("xlsx", "xls")) {
+      read_excel(path)
+    } else {
+      stop("Непідтримуваний формат файлу")
+    }
+  }, error = function(e) {
+    stop(paste("Помилка читання файлу:", e$message))
+  })
+  
+  names(df) <- trimws(names(df))
+  names(df) <- iconv(names(df), from = "", to = "UTF-8", sub = "")
+  
+  df %>%
+    mutate(across(where(is.character), ~ iconv(.x, from = "", to = "UTF-8", sub = "")))
+}
+
+safe_parse_date <- function(x) {
+  x <- as.character(x)
+  out <- suppressWarnings(ymd_hms(x, quiet = TRUE))
+  if (all(is.na(out))) out <- suppressWarnings(dmy_hms(x, quiet = TRUE))
+  if (all(is.na(out))) out <- suppressWarnings(ymd(x, quiet = TRUE))
+  if (all(is.na(out))) out <- suppressWarnings(dmy(x, quiet = TRUE))
+  as.POSIXct(out, tz = "UTC")
+}
+
+make_node <- function(df, mode = "brand_category") {
+  df %>%
+    mutate(
+      brand = coalesce(as.character(Бренд), "Unknown"),
+      product_name = coalesce(as.character(product_name), "Unknown"),
+      node = case_when(
+        mode == "category" ~ product_name,
+        mode == "brand" ~ brand,
+        TRUE ~ paste(brand, product_name, sep = " | ")
+      )
+    )
+}
+
+prepare_events <- function(df, node_mode = "brand_category") {
+  df %>%
+    mutate(
+      client_id = as.character(client_id),
+      transaction_id = as.character(transaction_id),
+      transaction_date = safe_parse_date(transaction_date)
+    ) %>%
+    filter(
+      !is.na(client_id), trimws(client_id) != "",
+      !is.na(transaction_id), trimws(transaction_id) != "",
+      !is.na(transaction_date)
+    ) %>%
+    make_node(node_mode) %>%
+    distinct(client_id, transaction_id, transaction_date, node) %>%
+    arrange(client_id, transaction_date, transaction_id, node) %>%
+    group_by(client_id, transaction_id, transaction_date) %>%
+    summarise(
+      basket_nodes = list(sort(unique(node))),
+      basket_label = paste(sort(unique(node)), collapse = " + "),
+      .groups = "drop"
+    ) %>%
+    arrange(client_id, transaction_date, transaction_id) %>%
+    group_by(client_id) %>%
+    mutate(step = row_number()) %>%
+    ungroup()
+}
+
+build_transitions <- function(events, min_days = 0, max_days = 365) {
+  build_event_links(events, min_days, max_days) %>%
+    filter(next_valid) %>%
+    transmute(
+      client_id,
+      transaction_id,
+      transaction_date,
+      basket_nodes,
+      basket_label,
+      next_basket,
+      next_nodes,
+      next_date,
+      lag_days
+    )
+}
+
+build_item_transitions <- function(transitions_df) {
+  transitions_df %>%
+    rowwise() %>%
+    mutate(
+      pair_tbl = list(
+        expand_grid(
+          from = unlist(basket_nodes),
+          to = unlist(next_nodes)
+        )
+      )
+    ) %>%
+    ungroup() %>%
+    select(client_id, lag_days, pair_tbl) %>%
+    unnest(pair_tbl) %>%
+    filter(!is.na(from), !is.na(to), from != to)
+}
+
+summarise_item_transitions <- function(item_transitions) {
+  from_base <- item_transitions %>%
+    distinct(client_id, from) %>%
+    count(from, name = "from_clients")
+  
+  item_transitions %>%
+    group_by(from, to) %>%
+    summarise(
+      clients = n_distinct(client_id),
+      transitions_n = n(),
+      avg_lag_days = round(mean(lag_days, na.rm = TRUE), 1),
+      median_lag_days = round(median(lag_days, na.rm = TRUE), 1),
+      .groups = "drop"
+    ) %>%
+    left_join(from_base, by = "from") %>%
+    mutate(conversion_from_clients = round(100 * clients / from_clients, 2)) %>%
+    arrange(desc(clients), desc(transitions_n))
+}
+
+build_step_paths <- function(events, max_steps = 6) {
+  events %>%
+    group_by(client_id) %>%
+    arrange(transaction_date, transaction_id, .by_group = TRUE) %>%
+    mutate(step = row_number()) %>%
+    filter(step <= max_steps) %>%
+    ungroup() %>%
+    select(client_id, step, basket_label) %>%
+    mutate(step_name = paste0("step_", step)) %>%
+    select(-step) %>%
+    pivot_wider(
+      names_from = step_name,
+      values_from = basket_label
+    )
+}
+
+
+
+make_journey_sankey_data <- function(path_df, max_steps = 6, top_n = 100) {
+  if (nrow(path_df) == 0) {
+    return(list(
+      nodes = data.frame(name = character()),
+      links = data.frame()
+    ))
+  }
+  
+  step_cols <- paste0("step_", 1:max_steps)
+  step_cols <- step_cols[step_cols %in% names(path_df)]
+  
+  all_links <- map_dfr(seq_len(length(step_cols) - 1), function(i) {
+    from_col <- step_cols[i]
+    to_col <- step_cols[i + 1]
+    
+    path_df %>%
+      filter(!is.na(.data[[from_col]]), !is.na(.data[[to_col]])) %>%
+      count(
+        from = .data[[from_col]],
+        to = .data[[to_col]],
+        name = "value",
+        sort = TRUE
+      ) %>%
+      mutate(
+        from_node = paste0(from_col, " | ", from),
+        to_node = paste0(to_col, " | ", to)
+      )
+  })
+  
+  all_links <- all_links %>%
+    arrange(desc(value)) %>%
+    slice_head(n = top_n)
+  
+  nodes <- data.frame(
+    name = unique(c(all_links$from_node, all_links$to_node)),
+    stringsAsFactors = FALSE
+  )
+  
+  links <- all_links %>%
+    mutate(
+      source = match(from_node, nodes$name) - 1,
+      target = match(to_node, nodes$name) - 1
+    ) %>%
+    select(source, target, value)
+  
+  list(nodes = nodes, links = links)
+}
+
+build_replenishment <- function(df, node_mode = "brand_category", min_days = 1, max_days = 365) {
+  df %>%
+    mutate(
+      client_id = as.character(client_id),
+      transaction_id = as.character(transaction_id),
+      transaction_date = safe_parse_date(transaction_date)
+    ) %>%
+    filter(
+      !is.na(client_id), trimws(client_id) != "",
+      !is.na(transaction_id), trimws(transaction_id) != "",
+      !is.na(transaction_date)
+    ) %>%
+    make_node(node_mode) %>%
+    distinct(client_id, transaction_id, transaction_date, node) %>%
+    arrange(client_id, node, transaction_date) %>%
+    group_by(client_id, node) %>%
+    mutate(
+      next_same_date = lead(transaction_date),
+      lag_days = as.numeric(difftime(next_same_date, transaction_date, units = "days"))
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(lag_days), lag_days >= min_days, lag_days <= max_days)
+}
+
+summarise_replenishment <- function(repl_df) {
+  repl_df %>%
+    group_by(node) %>%
+    summarise(
+      clients = n_distinct(client_id),
+      repeats_n = n(),
+      avg_repurchase_days = round(mean(lag_days, na.rm = TRUE), 1),
+      median_repurchase_days = round(median(lag_days, na.rm = TRUE), 1),
+      .groups = "drop"
+    ) %>%
+    arrange(avg_repurchase_days)
+}
+
+build_data_audit <- function(df) {
+  df2 <- df %>%
+    mutate(
+      client_id = as.character(client_id),
+      transaction_id = as.character(transaction_id),
+      transaction_date_raw = as.character(transaction_date),
+      transaction_date_parsed = safe_parse_date(transaction_date),
+      product_name = as.character(product_name),
+      Бренд = as.character(Бренд)
+    )
+  
+  records_n <- nrow(df2)
+  clients_n <- n_distinct(df2$client_id[!is.na(df2$client_id) & trimws(df2$client_id) != ""])
+  transactions_n <- n_distinct(df2$transaction_id[!is.na(df2$transaction_id) & trimws(df2$transaction_id) != ""])
+  categories_n <- n_distinct(df2$product_name[!is.na(df2$product_name) & trimws(df2$product_name) != ""])
+  brands_n <- n_distinct(df2$Бренд[!is.na(df2$Бренд) & trimws(df2$Бренд) != ""])
+  
+  valid_dates <- df2$transaction_date_parsed[!is.na(df2$transaction_date_parsed)]
+  min_date <- if (length(valid_dates) > 0) min(valid_dates) else NA
+  max_date <- if (length(valid_dates) > 0) max(valid_dates) else NA
+  
+  avg_records_per_client <- ifelse(clients_n > 0, round(records_n / clients_n, 2), NA)
+  avg_transactions_per_client <- ifelse(clients_n > 0, round(transactions_n / clients_n, 2), NA)
+  
+  metrics <- tibble::tibble(
+    Показник = c(
+      "Кількість записів",
+      "Кількість транзакцій",
+      "Кількість клієнтів",
+      "Кількість категорій",
+      "Кількість брендів",
+      "Мінімальна дата",
+      "Максимальна дата",
+      "Кількість валідних дат",
+      "Середня кількість записів на клієнта",
+      "Середня кількість транзакцій на клієнта"
+    ),
+    Значення = c(
+      records_n,
+      transactions_n,
+      clients_n,
+      categories_n,
+      brands_n,
+      ifelse(all(is.na(min_date)), NA, as.character(as.Date(min_date))),
+      ifelse(all(is.na(max_date)), NA, as.character(as.Date(max_date))),
+      length(valid_dates),
+      avg_records_per_client,
+      avg_transactions_per_client
+    )
+  )
+  
+  missing_tbl <- tibble::tibble(
+    Поле = c("client_id", "transaction_id", "transaction_date", "product_name", "Бренд"),
+    Пропущено = c(
+      sum(is.na(df2$client_id) | trimws(df2$client_id) == ""),
+      sum(is.na(df2$transaction_id) | trimws(df2$transaction_id) == ""),
+      sum(is.na(df2$transaction_date_raw) | trimws(df2$transaction_date_raw) == ""),
+      sum(is.na(df2$product_name) | trimws(df2$product_name) == ""),
+      sum(is.na(df2$Бренд) | trimws(df2$Бренд) == "")
+    ),
+    `Унікальних значень` = c(
+      n_distinct(df2$client_id[!is.na(df2$client_id) & trimws(df2$client_id) != ""]),
+      n_distinct(df2$transaction_id[!is.na(df2$transaction_id) & trimws(df2$transaction_id) != ""]),
+      n_distinct(df2$transaction_date_raw[!is.na(df2$transaction_date_raw) & trimws(df2$transaction_date_raw) != ""]),
+      n_distinct(df2$product_name[!is.na(df2$product_name) & trimws(df2$product_name) != ""]),
+      n_distinct(df2$Бренд[!is.na(df2$Бренд) & trimws(df2$Бренд) != ""])
+    )
+  ) %>%
+    mutate(`% пропусків` = round(100 * Пропущено / records_n, 2))
+  
+  client_activity <- df2 %>%
+    filter(
+      !is.na(client_id), trimws(client_id) != "",
+      !is.na(transaction_id), trimws(transaction_id) != ""
+    ) %>%
+    distinct(client_id, transaction_id) %>%
+    count(client_id, name = "transactions_per_client")
+  
+  client_activity_summary <- tibble::tibble(
+    Показник = c(
+      "Клієнтів з 1 транзакцією",
+      "Клієнтів з 2+ транзакціями",
+      "Клієнтів з 3+ транзакціями",
+      "Клієнтів з 5+ транзакціями"
+    ),
+    Значення = c(
+      sum(client_activity$transactions_per_client == 1, na.rm = TRUE),
+      sum(client_activity$transactions_per_client >= 2, na.rm = TRUE),
+      sum(client_activity$transactions_per_client >= 3, na.rm = TRUE),
+      sum(client_activity$transactions_per_client >= 5, na.rm = TRUE)
+    )
+  )
+  
+  category_top <- df2 %>%
+    filter(!is.na(product_name), trimws(product_name) != "") %>%
+    count(product_name, sort = TRUE, name = "Кількість записів")
+  
+  brand_top <- df2 %>%
+    filter(!is.na(Бренд), trimws(Бренд) != "") %>%
+    count(Бренд, sort = TRUE, name = "Кількість записів")
+  
+  list(
+    metrics = metrics,
+    missing_tbl = missing_tbl,
+    client_activity_summary = client_activity_summary,
+    category_top = category_top,
+    brand_top = brand_top
+  )
+}
+
+make_recursive_focused_sankey_data <- function(
+    transitions_summary,
+    start_node,
+    depth = 3,
+    top_n_per_node = 3,
+    min_clients_link = 1,
+    max_label_chars = 32
+) {
+  if (is.null(start_node) || is.na(start_node) || start_node == "") {
+    return(list(
+      nodes = data.frame(
+        name = character(),
+        full_name = character(),
+        level = character(),
+        stringsAsFactors = FALSE
+      ),
+      links = data.frame(
+        source = integer(),
+        target = integer(),
+        value = numeric()
+      )
+    ))
+  }
+  
+  pretty_basket_label <- function(x, max_chars = 32) {
+    x <- as.character(x)
+    x <- ifelse(
+      stringr::str_detect(x, fixed(" + ")),
+      paste0(stringr::str_split_fixed(x, fixed(" + "), 2)[, 1], " +..."),
+      x
+    )
+    ifelse(nchar(x) > max_chars, paste0(substr(x, 1, max_chars - 3), "..."), x)
+  }
+  
+  all_links <- list()
+  current_nodes <- tibble::tibble(node = start_node, level_num = 0)
+  visited_edges <- character()
+  
+  for (lvl in seq_len(depth)) {
+    next_links <- purrr::map_dfr(current_nodes$node, function(curr_node) {
+      transitions_summary %>%
+        dplyr::filter(from == curr_node, clients >= min_clients_link) %>%
+        dplyr::arrange(desc(clients), desc(transitions_n)) %>%
+        dplyr::slice_head(n = top_n_per_node) %>%
+        dplyr::transmute(
+          from_node = from,
+          to_node = to,
+          value = clients,
+          from_level = lvl - 1,
+          to_level = lvl
+        )
+    })
+    
+    if (nrow(next_links) == 0) break
+    
+    next_links <- next_links %>%
+      dplyr::mutate(edge_id = paste(from_node, to_node, from_level, to_level, sep = "|||")) %>%
+      dplyr::filter(!edge_id %in% visited_edges)
+    
+    if (nrow(next_links) == 0) break
+    
+    visited_edges <- c(visited_edges, next_links$edge_id)
+    all_links[[lvl]] <- next_links
+    current_nodes <- next_links %>%
+      dplyr::distinct(node = to_node, level_num = to_level)
+  }
+  
+  all_links_df <- dplyr::bind_rows(all_links)
+  
+  if (nrow(all_links_df) == 0) {
+    return(list(
+      nodes = data.frame(
+        name = character(),
+        full_name = character(),
+        level = character(),
+        stringsAsFactors = FALSE
+      ),
+      links = data.frame(
+        source = integer(),
+        target = integer(),
+        value = numeric()
+      )
+    ))
+  }
+  
+  node_levels_from <- all_links_df %>%
+    dplyr::distinct(full_name = from_node, level_num = from_level)
+  
+  node_levels_to <- all_links_df %>%
+    dplyr::distinct(full_name = to_node, level_num = to_level)
+  
+  node_levels <- dplyr::bind_rows(node_levels_from, node_levels_to) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(level_num, full_name)
+  
+  nodes <- node_levels %>%
+    dplyr::mutate(
+      node_key = paste(level_num, full_name, sep = "|||"),
+      name = pretty_basket_label(full_name, max_chars = max_label_chars),
+      level = paste0("level_", level_num)
+    ) %>%
+    dplyr::select(node_key, full_name, name, level)
+  
+  links <- all_links_df %>%
+    dplyr::mutate(
+      source_key = paste(from_level, from_node, sep = "|||"),
+      target_key = paste(to_level, to_node, sep = "|||"),
+      source = match(source_key, nodes$node_key) - 1,
+      target = match(target_key, nodes$node_key) - 1
+    ) %>%
+    dplyr::select(source, target, value)
+  
+  list(
+    nodes = as.data.frame(nodes),
+    links = as.data.frame(links)
+  )
+}
+
+split_node_fields <- function(x, node_mode) {
+  x <- as.character(x)
+  
+  if (node_mode == "brand_category") {
+    parts <- stringr::str_split_fixed(x, fixed(" | "), 2)
+    tibble::tibble(
+      node_label = x,
+      brand = trimws(parts[, 1]),
+      category = trimws(parts[, 2])
+    )
+  } else if (node_mode == "brand") {
+    tibble::tibble(
+      node_label = x,
+      brand = x,
+      category = NA_character_
+    )
+  } else {
+    tibble::tibble(
+      node_label = x,
+      brand = NA_character_,
+      category = x
+    )
+  }
+}
+
+safe_input_value <- function(x) {
+  if (is.null(x) || length(x) == 0) return("")
+  x <- as.character(x)[1]
+  if (is.na(x) || trimws(x) == "") return("")
+  trimws(x)
+}
+
+norm_text <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  stringr::str_to_lower(x)
+}
+
+make_cohort_sankey_data <- function(event_links,
+                                    start_node,
+                                    depth = 3,
+                                    top_n_per_node = 10,
+                                    min_clients_link = 1,
+                                    max_label_chars = 32,
+                                    adaptive_mode = TRUE,
+                                    small_cohort_threshold = 100,
+                                    small_branch_threshold = 15,
+                                    top_n_large = 10,
+                                    min_pct_large = 1,
+                                    min_clients_large = 2) {
+  
+  empty_result <- list(
+    nodes = data.frame(
+      node_key = character(),
+      full_name = character(),
+      name = character(),
+      level = character(),
+      stringsAsFactors = FALSE
+    ),
+    links = data.frame(
+      source = integer(),
+      target = integer(),
+      value = numeric(),
+      clients = numeric(),
+      pct_start = numeric(),
+      pct_from = numeric(),
+      step_from = integer(),
+      step_to = integer()
+    ),
+    details = data.frame(
+      step_from = integer(),
+      step_to = integer(),
+      from = character(),
+      to = character(),
+      clients = numeric(),
+      pct_start = numeric(),
+      pct_from = numeric(),
+      stringsAsFactors = FALSE
+    ),
+    other_details = data.frame(
+      step_from = integer(),
+      step_to = integer(),
+      from = character(),
+      to_real = character(),
+      clients = numeric(),
+      pct_start = numeric(),
+      pct_from = numeric(),
+      grouped_into = character(),
+      stringsAsFactors = FALSE
+    ),
+    cohort_size = 0,
+    display_mode = "empty",
+    display_message = "Немає даних для побудови Sankey."
+  )
+  
+  if (is.null(start_node) || is.na(start_node) || trimws(start_node) == "") {
+    return(empty_result)
+  }
+  
+  pretty_label <- function(x, max_chars = 32) {
+    x <- as.character(x)
+    ifelse(
+      nchar(x) > max_chars,
+      paste0(substr(x, 1, max_chars - 3), "..."),
+      x
+    )
+  }
+  
+  ev <- event_links %>%
+    mutate(
+      next_basket_label = ifelse(next_valid, next_basket, NA_character_)
+    )
+  
+  start_events <- ev %>%
+    rowwise() %>%
+    mutate(has_start_node = start_node %in% unlist(basket_nodes)) %>%
+    ungroup() %>%
+    filter(has_start_node) %>%
+    group_by(client_id) %>%
+    slice_min(order_by = step, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    transmute(
+      client_id,
+      current_step = step,
+      current_label = start_node,
+      next_step = ifelse(next_valid, next_step, NA_real_),
+      next_basket_label = ifelse(next_valid, next_basket, NA_character_)
+    )
+  
+  if (nrow(start_events) == 0) {
+    return(empty_result)
+  }
+  
+  cohort_size <- n_distinct(start_events$client_id)
+  all_links <- list()
+  current_states <- start_events %>%
+    mutate(level_num = 0)
+  
+  used_reduction <- FALSE
+  
+  all_other_details <- list()
+  
+  for (lvl in seq_len(depth)) {
+    if (nrow(current_states) == 0) break
+    
+    next_candidates <- current_states %>%
+      mutate(
+        next_label_raw = ifelse(
+          is.na(next_basket_label) | trimws(next_basket_label) == "",
+          "Не повернулися",
+          next_basket_label
+        )
+      )
+    
+    if (nrow(next_candidates) == 0) break
+    
+    level_links <- purrr::map_dfr(unique(next_candidates$current_label), function(src_label) {
+      src_df <- next_candidates %>%
+        filter(current_label == src_label)
+      
+      from_base_n <- n_distinct(src_df$client_id)
+      
+      raw_counts <- src_df %>%
+        group_by(next_label_raw) %>%
+        summarise(
+          clients = n_distinct(client_id),
+          .groups = "drop"
+        ) %>%
+        arrange(desc(clients), next_label_raw)
+      
+      if (nrow(raw_counts) == 0) {
+        return(NULL)
+      }
+      
+      no_return_tbl <- raw_counts %>%
+        filter(next_label_raw == "Не повернулися")
+      
+      real_targets <- raw_counts %>%
+        filter(next_label_raw != "Не повернулися")
+      
+      selected_real <- NULL
+      other_tbl <- NULL
+      other_details_tbl <- NULL
+      
+      auto_reduce <- adaptive_mode &&
+        (from_base_n > small_cohort_threshold || nrow(real_targets) > small_branch_threshold)
+      
+      if (!auto_reduce) {
+        selected_real <- real_targets %>%
+          filter(clients >= min_clients_link) %>%
+          arrange(desc(clients), next_label_raw)
+      } else {
+        used_reduction <<- TRUE
+        
+        # 1. Завжди беремо top N найбільших переходів
+        selected_real <- real_targets %>%
+          arrange(desc(clients), next_label_raw) %>%
+          slice_head(n = top_n_large)
+        
+        # 2. Усе інше йде в "Інші переходи"
+        other_real <- real_targets %>%
+          filter(!(next_label_raw %in% selected_real$next_label_raw))
+        
+        other_clients_sum <- sum(other_real$clients, na.rm = TRUE)
+        other_details_tbl <- NULL
+        other_tbl <- NULL
+        
+        # 3. Створюємо "Інші переходи" тільки якщо там справді є що агрегувати
+        if (nrow(other_real) > 0 && other_clients_sum >= min_clients_large) {
+          other_tbl <- tibble::tibble(
+            next_label_raw = "Інші переходи",
+            clients = other_clients_sum
+          )
+          
+          other_details_tbl <- other_real %>%
+            mutate(
+              step_from = lvl - 1,
+              step_to = lvl,
+              from = src_label,
+              to_real = next_label_raw,
+              pct_from = round(100 * clients / from_base_n, 1),
+              pct_start = round(100 * clients / cohort_size, 1),
+              grouped_into = "Інші переходи"
+            ) %>%
+            select(step_from, step_to, from, to_real, clients, pct_start, pct_from, grouped_into)
+        }
+      }
+      
+      if (!is.null(other_details_tbl) && nrow(other_details_tbl) > 0) {
+        all_other_details[[length(all_other_details) + 1]] <<- other_details_tbl
+      }
+      
+      bind_rows(selected_real, other_tbl, no_return_tbl) %>%
+        mutate(
+          from = src_label,
+          to = next_label_raw,
+          from_level = lvl - 1,
+          to_level = lvl,
+          from_base = from_base_n,
+          pct_from = round(100 * clients / from_base_n, 1),
+          pct_start = round(100 * clients / cohort_size, 1)
+        ) %>%
+        select(from, to, from_level, to_level, clients, from_base, pct_from, pct_start)
+    })
+    
+    if (nrow(level_links) == 0) break
+    
+    all_links[[lvl]] <- level_links
+    
+    continue_targets <- level_links %>%
+      filter(!(to %in% c("Не повернулися", "Інші переходи")))
+    
+    if (nrow(continue_targets) == 0) break
+    
+    next_states <- purrr::map_dfr(seq_len(nrow(continue_targets)), function(i) {
+      src_label_i <- continue_targets$from[i]
+      to_label_i <- continue_targets$to[i]
+      
+      src_clients <- next_candidates %>%
+        filter(current_label == src_label_i) %>%
+        filter(next_label_raw == to_label_i) %>%
+        distinct(client_id, next_step)
+      
+      if (nrow(src_clients) == 0) return(NULL)
+      
+      ev_next <- ev %>%
+        transmute(
+          client_id,
+          reached_step = step,
+          current_label = basket_label,
+          next_step_new = ifelse(next_valid, next_step, NA_real_),
+          next_basket_label_new = ifelse(next_valid, next_basket, NA_character_)
+        )
+      
+      src_clients2 <- src_clients %>%
+        transmute(
+          client_id,
+          reached_step = next_step
+        )
+      
+      ev_next %>%
+        inner_join(src_clients2, by = c("client_id", "reached_step")) %>%
+        transmute(
+          client_id,
+          current_step = reached_step,
+          current_label,
+          next_step = next_step_new,
+          next_basket_label = next_basket_label_new,
+          level_num = continue_targets$to_level[i]
+        ) %>%
+        distinct()
+    })
+    
+    if (nrow(next_states) == 0) break
+    
+    current_states <- next_states
+  }
+  
+  all_links_df <- bind_rows(all_links)
+  
+  if (nrow(all_links_df) == 0) {
+    return(list(
+      nodes = data.frame(
+        node_key = character(),
+        full_name = character(),
+        name = character(),
+        level = character(),
+        stringsAsFactors = FALSE
+      ),
+      links = data.frame(
+        source = integer(),
+        target = integer(),
+        value = numeric(),
+        clients = numeric(),
+        pct_start = numeric(),
+        pct_from = numeric(),
+        step_from = integer(),
+        step_to = integer()
+      ),
+      details = data.frame(
+        step_from = integer(),
+        step_to = integer(),
+        from = character(),
+        to = character(),
+        clients = numeric(),
+        pct_start = numeric(),
+        pct_from = numeric(),
+        stringsAsFactors = FALSE
+      ),
+      other_details = bind_rows(all_other_details),
+      cohort_size = cohort_size,
+      display_mode = "empty_after_filter",
+      display_message = "Після застосування фільтрів переходів не залишилося."
+    ))
+  }
+  
+  node_levels_from <- all_links_df %>%
+    distinct(full_name = from, level_num = from_level)
+  
+  node_levels_to <- all_links_df %>%
+    distinct(full_name = to, level_num = to_level)
+  
+  nodes <- bind_rows(node_levels_from, node_levels_to) %>%
+    distinct() %>%
+    arrange(level_num, full_name) %>%
+    mutate(
+      node_key = paste(level_num, full_name, sep = "|||"),
+      name = pretty_label(full_name, max_chars = max_label_chars),
+      level = paste0("level_", level_num)
+    ) %>%
+    select(node_key, full_name, name, level)
+  
+  links <- all_links_df %>%
+    mutate(
+      source_key = paste(from_level, from, sep = "|||"),
+      target_key = paste(to_level, to, sep = "|||"),
+      source = match(source_key, nodes$node_key) - 1,
+      target = match(target_key, nodes$node_key) - 1,
+      value = clients
+    ) %>%
+    select(
+      source, target, value,
+      clients, pct_start, pct_from,
+      step_from = from_level,
+      step_to = to_level
+    )
+  
+  details <- all_links_df %>%
+    transmute(
+      step_from = from_level,
+      step_to = to_level,
+      from,
+      to,
+      clients,
+      pct_start,
+      pct_from
+    ) %>%
+    arrange(step_to, desc(clients), from, to)
+  
+  other_details <- bind_rows(all_other_details)
+  
+  display_mode <- if (used_reduction) "reduced" else "full"
+  display_message <- if (used_reduction) {
+    paste0(
+      "Для цього вузла знайдено багато переходів. ",
+      "Для читабельності показані лише основні гілки, решта об'єднана в 'Інші переходи'."
+    )
+  } else {
+    "Для цього вузла показані всі переходи."
+  }
+  
+  list(
+    nodes = as.data.frame(nodes),
+    links = as.data.frame(links),
+    details = as.data.frame(details),
+    other_details = as.data.frame(other_details),
+    cohort_size = cohort_size,
+    display_mode = display_mode,
+    display_message = display_message
+  )
+}
+
+build_cohort_sankey_kpis <- function(sk) {
+  if (is.null(sk) || is.null(sk$details) || nrow(sk$details) == 0) {
+    return(tibble::tibble(
+      Показник = c(
+        "Розмір стартової когорти",
+        "Найпопулярніший 1-й наступний кошик",
+        "Частка, що не повернулися після старту"
+      ),
+      Значення = c("-", "-", "-")
+    ))
+  }
+  
+  first_step <- sk$details %>%
+    filter(step_from == 0, step_to == 1)
+  
+  best_next <- first_step %>%
+    filter(!(to %in% c("Не повернулися", "Інші кошики"))) %>%
+    arrange(desc(clients)) %>%
+    slice(1)
+  
+  no_return_clients <- first_step %>%
+    filter(to == "Не повернулися") %>%
+    summarise(val = sum(clients, na.rm = TRUE)) %>%
+    pull(val)
+  
+  if (length(no_return_clients) == 0 || is.na(no_return_clients)) {
+    no_return_clients <- 0
+  }
+  
+  no_return_pct <- if (is.null(sk$cohort_size) || sk$cohort_size == 0) {
+    0
+  } else {
+    round(100 * no_return_clients / sk$cohort_size, 1)
+  }
+  
+  tibble::tibble(
+    Показник = c(
+      "Розмір стартової когорти",
+      "Найпопулярніший 1-й наступний кошик",
+      "Частка, що не повернулися після старту"
+    ),
+    Значення = c(
+      sk$cohort_size,
+      if (nrow(best_next) == 0) "-" else paste0(best_next$to, " (", best_next$pct_start, "%)"),
+      paste0(no_return_clients, " клієнтів (", no_return_pct, "%)")
+    )
+  )
+}
+
+
+
+build_cohort_table <- function(df) {
+  df2 <- df %>%
+    mutate(
+      client_id = as.character(client_id),
+      transaction_id = as.character(transaction_id),
+      transaction_date = safe_parse_date(transaction_date)
+    ) %>%
+    filter(
+      !is.na(client_id), trimws(client_id) != "",
+      !is.na(transaction_id), trimws(transaction_id) != "",
+      !is.na(transaction_date)
+    ) %>%
+    distinct(client_id, transaction_id, transaction_date) %>%
+    mutate(
+      order_month = floor_date(as.Date(transaction_date), unit = "month")
+    )
+  
+  first_purchase <- df2 %>%
+    group_by(client_id) %>%
+    summarise(
+      cohort_month = min(order_month),
+      .groups = "drop"
+    )
+  
+  cohort_data <- df2 %>%
+    left_join(first_purchase, by = "client_id") %>%
+    mutate(
+      cohort_index = interval(cohort_month, order_month) %/% months(1)
+    ) %>%
+    filter(cohort_index >= 0)
+  
+  cohort_size <- cohort_data %>%
+    filter(cohort_index == 0) %>%
+    group_by(cohort_month) %>%
+    summarise(
+      cohort_size = n_distinct(client_id),
+      .groups = "drop"
+    )
+  
+  retention_long <- cohort_data %>%
+    group_by(cohort_month, cohort_index) %>%
+    summarise(
+      customers_n = n_distinct(client_id),
+      .groups = "drop"
+    ) %>%
+    left_join(cohort_size, by = "cohort_month") %>%
+    mutate(
+      retention_pct = round(100 * customers_n / cohort_size, 1)
+    ) %>%
+    arrange(cohort_month, cohort_index)
+  
+  retention_wide <- retention_long %>%
+    select(cohort_month, cohort_index, retention_pct) %>%
+    mutate(cohort_index = paste0("M", cohort_index)) %>%
+    pivot_wider(
+      names_from = cohort_index,
+      values_from = retention_pct
+    ) %>%
+    arrange(cohort_month)
+  
+  list(
+    long = retention_long,
+    wide = retention_wide
+  )
+}
+
+build_cohort_kpis <- function(retention_long) {
+  if (nrow(retention_long) == 0) {
+    return(tibble::tibble(
+      Показник = character(),
+      Значення = character()
+    ))
+  }
+  
+  m1 <- retention_long %>%
+    filter(cohort_index == 1) %>%
+    summarise(val = round(mean(retention_pct, na.rm = TRUE), 1)) %>%
+    pull(val)
+  
+  m3 <- retention_long %>%
+    filter(cohort_index == 3) %>%
+    summarise(val = round(mean(retention_pct, na.rm = TRUE), 1)) %>%
+    pull(val)
+  
+  best_cohort <- retention_long %>%
+    filter(cohort_index == 1) %>%
+    arrange(desc(retention_pct)) %>%
+    slice(1)
+  
+  worst_cohort <- retention_long %>%
+    filter(cohort_index == 1) %>%
+    arrange(retention_pct) %>%
+    slice(1)
+  
+  tibble::tibble(
+    Показник = c(
+      "Середній retention на 1-й місяць",
+      "Середній retention на 3-й місяць",
+      "Найкраща когорта на 1-й місяць",
+      "Найслабша когорта на 1-й місяць"
+    ),
+    Значення = c(
+      paste0(ifelse(is.na(m1), "-", m1), "%"),
+      paste0(ifelse(is.na(m3), "-", m3), "%"),
+      if (nrow(best_cohort) == 0) "-" else paste0(as.character(best_cohort$cohort_month), " (", best_cohort$retention_pct, "%)"),
+      if (nrow(worst_cohort) == 0) "-" else paste0(as.character(worst_cohort$cohort_month), " (", worst_cohort$retention_pct, "%)")
+    )
+  )
+}
+
+plot_cohort_heatmap <- function(retention_long) {
+  if (nrow(retention_long) == 0) return(NULL)
+  
+  ggplot(retention_long, aes(
+    x = factor(cohort_index),
+    y = factor(cohort_month),
+    fill = retention_pct
+  )) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = paste0(retention_pct, "%")), size = 3) +
+    scale_fill_gradient(low = "#E5F0FF", high = "#2563EB", na.value = "grey90") +
+    labs(
+      title = "Когортний аналіз утримання клієнтів",
+      subtitle = "Кожен рядок — когорта за місяцем першої покупки",
+      x = "Місяць життя когорти",
+      y = "Когорта",
+      fill = "Retention %"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 0, vjust = 0.5),
+      axis.text.y = element_text(size = 10)
+    )
+}
+
+calc_sankey_height <- function(nodes_df,
+                               min_height = 500,
+                               max_height = 2200,
+                               px_per_node = 36,
+                               extra_padding = 120) {
+  if (is.null(nodes_df) || nrow(nodes_df) == 0) return(min_height)
+  
+  max_nodes_in_level <- nodes_df %>%
+    count(level, name = "n") %>%
+    summarise(max_n = max(n, na.rm = TRUE)) %>%
+    pull(max_n)
+  
+  h <- extra_padding + max_nodes_in_level * px_per_node
+  h <- max(min_height, h)
+  h <- min(max_height, h)
+  
+  h
+}
+
+build_event_links <- function(events, min_days = 0, max_days = 365) {
+  events %>%
+    arrange(client_id, transaction_date, transaction_id) %>%
+    group_by(client_id) %>%
+    mutate(
+      step = row_number(),
+      next_step = lead(step),
+      next_basket = lead(basket_label),
+      next_nodes = lead(basket_nodes),
+      next_date = lead(transaction_date),
+      lag_days = as.numeric(difftime(next_date, transaction_date, units = "days")),
+      next_valid = !is.na(next_step) &
+        !is.na(lag_days) &
+        lag_days >= min_days &
+        lag_days <= max_days
+    ) %>%
+    ungroup()
+}
+
+ui <- secure_app(
+  fluidPage(
+    titlePanel("Аналіз послідовностей покупок"),
+    h3("Ви увійшли в систему"),
+    verbatimTextOutput("current_user"),
+    sidebarLayout(
+      sidebarPanel(
+        fileInput("file", "Завантажте файл CSV/XLSX", accept = c(".csv", ".xlsx", ".xls")),
+        radioButtons(
+          "node_mode", "Рівень вузла",
+          choices = c(
+            "Бренд + категорія" = "brand_category",
+            "Категорія" = "category",
+            "Бренд" = "brand"
+          ),
+          selected = "brand_category"
+        ),
+        numericInput("min_days", "Мін. лаг (днів)", 1, min = 0),
+        numericInput("max_days", "Макс. лаг (днів)", 365, min = 1),
+        numericInput("max_steps", "Макс. кроків у маршруті", 6, min = 2, max = 10),
+        numericInput("top_n", "Top переходів / лінків", 100, min = 10, max = 500),
+        hr()
+      ),
+      mainPanel(
+        tabsetPanel(
+          tabPanel(
+            "Аудит даних",
+            br(),
+            h4("Основні метрики"),
+            DTOutput("audit_metrics_tbl"),
+            br(),
+            h4("Якість даних по полях"),
+            DTOutput("audit_missing_tbl"),
+            br(),
+            h4("Активність клієнтів"),
+            DTOutput("audit_client_activity_summary_tbl"),
+            br(),
+            h4("Топ категорій"),
+            DTOutput("audit_category_top_tbl"),
+            br(),
+            h4("Топ брендів"),
+            DTOutput("audit_brand_top_tbl")
+          ),
+          tabPanel(
+            "Переходи",
+            br(),
+            fluidRow(
+              conditionalPanel(
+                condition = "input.node_mode == 'brand_category' || input.node_mode == 'brand'",
+                column(
+                  4,
+                  selectizeInput(
+                    "filter_brand", "Фільтр по бренду",
+                    choices = NULL,
+                    selected = "",
+                    multiple = FALSE,
+                    options = list(
+                      placeholder = "Усі бренди",
+                      maxOptions = 500,
+                      create = FALSE
+                    )
+                  )
+                )
+              ),
+              conditionalPanel(
+                condition = "input.node_mode == 'brand_category' || input.node_mode == 'category'",
+                column(
+                  4,
+                  selectizeInput(
+                    "filter_category", "Фільтр по категорії",
+                    choices = NULL,
+                    selected = "",
+                    multiple = FALSE,
+                    options = list(
+                      placeholder = "Усі категорії",
+                      maxOptions = 500,
+                      create = FALSE
+                    )
+                  )
+                )
+              ),
+              column(
+                4,
+                selectizeInput(
+                  "filter_node",
+                  "Фільтр по вузлу",
+                  choices = NULL,
+                  selected = "",
+                  multiple = FALSE,
+                  options = list(
+                    placeholder = "Усі вузли",
+                    maxOptions = 1000,
+                    create = FALSE
+                  )
+                )
+              )
+            )
+            ,
+            br(),
+            DTOutput("from_tbl")
+          ),
+          tabPanel(
+            "Journey",
+            br(),
+            fluidRow(
+              column(
+                4,
+                textInput("sankey_search", "Пошук вузла", value = "")
+              ),
+              column(
+                8,
+                selectizeInput("sankey_start_node", "Оберіть вузол", choices = NULL)
+              )
+            ),
+            
+            
+            br(),
+            fluidRow(
+              column(3, numericInput("journey_depth", "Глибина маршруту", 3, min = 1, max = 6)),
+              column(3, numericInput("journey_top_n", "Гілок з кожного вузла", 3, min = 1, max = 8)),
+              column(3, numericInput("journey_min_clients", "Мін. клієнтів у зв'язку", 2, min = 1, max = 100)),
+              column(3, numericInput("journey_label_chars", "Довжина підпису", 22, min = 10, max = 50))
+            ),
+            br(),
+            sankeyNetworkOutput("journey_sankey_plot", height = "850px"),
+            br(),
+            h4("Повні назви вузлів"),
+            DTOutput("journey_nodes_tbl")
+          ),
+          tabPanel(
+            "Шлях клієнтів від вузла",
+            br(),
+            wellPanel(
+              HTML("
+      <b>Як читати цей графік:</b><br/>
+      Ви обираєте стартовий вузол (бренд / категорію / бренд+категорію).<br/>
+      Далі графік показує, <b>який наступний чек</b> роблять клієнти після першої покупки цього вузла.<br/>
+      Відображаються лише наймасовіші наступні кошики, а решта об'єднується у <b>'Інші кошики'</b>.<br/>
+      Якщо наступної покупки не було — це показується як <b>'Не повернулися'</b>.<br/><br/>
+      <b>Важливо:</b> це спеціально спрощена клієнтська візуалізація для читання маршруту після стартового вузла.
+    ")
+            ),
+            br(),
+            fluidRow(
+              column(
+                4,
+                textInput("cohort_sankey_search", "Пошук вузла", value = "")
+              ),
+              column(
+                8,
+                selectizeInput("cohort_sankey_start_node", "Оберіть стартовий вузол", choices = NULL)
+              )
+            ),
+            br(),
+            fluidRow(
+              column(
+                3,
+                numericInput("cohort_depth", "Глибина маршруту", 3, min = 1, max = 6)
+              ),
+              column(
+                3,
+                numericInput("cohort_top_n", "Топ кошиків з кожного вузла", 7, min = 1, max = 10)
+              ),
+              column(
+                3,
+                numericInput("cohort_min_clients", "Мін. клієнтів у зв'язку", 1, min = 1, max = 100)
+              ),
+              column(
+                3,
+                numericInput("cohort_label_chars", "Довжина підпису", 32, min = 10, max = 80)
+              )
+            ),
+            br(),
+            h4("Короткі висновки"),
+            DTOutput("cohort_sankey_kpi_tbl"),
+            br(),
+            htmlOutput("cohort_sankey_mode_text"),
+            br(),
+            uiOutput("cohort_sankey_plot_ui"),
+            br(),
+            h4("Розшифровка переходів"),
+            DTOutput("cohort_sankey_details_tbl"),
+            br(),
+            h4("Розшифровка 'Інші переходи'"),
+            DTOutput("cohort_sankey_other_details_tbl"),
+            br(),
+            h4("Повні назви вузлів"),
+            DTOutput("cohort_sankey_nodes_tbl")
+          ),
+          tabPanel(
+            "Когортний аналіз",
+            br(),
+            wellPanel(
+              HTML("
+      <b>Як читати цей звіт:</b><br/>
+      Рядок — це когорта клієнтів, які зробили першу покупку в одному місяці.<br/>
+      <b>0</b> — це 100% клієнтів у когорті.<br/>
+      <b>1</b> — який % цієї когорти повернувся в наступному місяці.<br/>
+      <b>2</b>, <b>3</b> і далі — утримання через 2, 3 та більше місяців.<br/><br/>
+      Це допомагає побачити, які когорти утримуються краще, а які швидко втрачаються.
+    ")
+            ),
+            br(),
+            h4("Ключові висновки"),
+            DTOutput("cohort_kpi_tbl"),
+            br(),
+            plotOutput("cohort_heatmap", height = "600px"),
+            br(),
+            h4("Детальна когортна таблиця"),
+            DTOutput("cohort_tbl")
+          ),
+          tabPanel("Повернення", DTOutput("replenishment_tbl"))
+        )
+      )
+    )
+  )
+)
+server <- function(input, output, session) {
+  updating_filters <- reactiveVal(FALSE)
+  
+  raw_data <- reactive({
+    req(input$file)
+    df <- read_input_data(input$file$datapath)
+    validate(
+      need(nrow(df) > 0, "Файл порожній")
+    )
+    df
+  })
+  
+  cleaned_data <- reactive({
+    df <- raw_data()
+    required_cols <- c("client_id", "transaction_id", "transaction_date", "product_name", "Бренд")
+    missing_cols <- setdiff(required_cols, names(df))
+    
+    validate(
+      need(length(missing_cols) == 0, paste("У файлі не вистачає колонок:", paste(missing_cols, collapse = ", ")))
+    )
+    
+    df
+  })
+  
+  events_data <- reactive({
+    prepare_events(cleaned_data(), node_mode = input$node_mode)
+  })
+  
+  event_links <- reactive({
+    build_event_links(
+      events_data(),
+      min_days = input$min_days,
+      max_days = input$max_days
+    )
+  })
+  
+  transitions_raw <- reactive({
+    event_links() %>%
+      filter(next_valid) %>%
+      transmute(
+        client_id,
+        transaction_id,
+        transaction_date,
+        basket_nodes,
+        basket_label,
+        next_basket,
+        next_nodes,
+        next_date,
+        lag_days
+      )
+  })
+  
+  item_transitions <- reactive({
+    build_item_transitions(transitions_raw())
+  })
+  
+  transitions_summary <- reactive({
+    summarise_item_transitions(item_transitions())
+  })
+  
+  filter_nodes_tbl <- reactive({
+    req(transitions_summary())
+    nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
+    split_node_fields(nodes, input$node_mode)
+  })
+  
+  
+  
+  replenishment_data <- reactive({
+    build_replenishment(
+      cleaned_data(),
+      node_mode = input$node_mode,
+      min_days = max(1, input$min_days),
+      max_days = input$max_days
+    )
+  })
+  
+  replenishment_summary <- reactive({
+    summarise_replenishment(replenishment_data())
+  })
+  
+  audit_data <- reactive({
+    build_data_audit(cleaned_data())
+  })
+  
+  cohort_data <- reactive({
+    build_cohort_table(cleaned_data())
+  })
+  
+  cohort_kpis <- reactive({
+    build_cohort_kpis(cohort_data()$long)
+  })
+  
+  filtered_from_choices <- reactive({
+    req(filter_nodes_tbl())
+    tbl <- filter_nodes_tbl()
+    mode <- input$node_mode
+    
+    brand_text <- safe_input_value(input$filter_brand)
+    category_text <- safe_input_value(input$filter_category)
+    node_text <- safe_input_value(input$filter_node)
+    
+    if (mode %in% c("brand_category", "brand") && brand_text != "") {
+      tbl <- tbl %>%
+        filter(!is.na(brand), trimws(brand) != "") %>%
+        filter(norm_text(brand) == norm_text(brand_text))
+    }
+    
+    if (mode %in% c("brand_category", "category") && category_text != "") {
+      tbl <- tbl %>%
+        filter(!is.na(category), trimws(category) != "") %>%
+        filter(norm_text(category) == norm_text(category_text))
+    }
+    
+    if (node_text != "") {
+      tbl <- tbl %>%
+        filter(node_label == node_text)
+    }
+    
+    tbl
+  })
+  
+  filtered_sankey_choices <- reactive({
+    req(transitions_summary())
+    
+    all_nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
+    
+    search_txt <- input$sankey_search
+    if (is.null(search_txt)) search_txt <- ""
+    search_txt <- trimws(tolower(search_txt))
+    
+    if (search_txt == "") {
+      return(all_nodes)
+    }
+    
+    all_nodes[stringr::str_detect(tolower(all_nodes), fixed(search_txt))]
+  })
+  
+  filtered_cohort_sankey_choices <- reactive({
+    req(transitions_summary())
+    
+    all_nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
+    
+    search_txt <- input$cohort_sankey_search
+    if (is.null(search_txt)) search_txt <- ""
+    search_txt <- trimws(tolower(search_txt))
+    
+    if (search_txt == "") {
+      return(all_nodes)
+    }
+    
+    all_nodes[stringr::str_detect(tolower(all_nodes), fixed(search_txt))]
+  })
+  
+  observe({
+    choices <- filtered_cohort_sankey_choices()
+    current_selected <- isolate(input$cohort_sankey_start_node)
+    
+    selected_value <- if (!is.null(current_selected) &&
+                          length(current_selected) > 0 &&
+                          current_selected %in% choices) {
+      current_selected
+    } else if (length(choices) > 0) {
+      choices[1]
+    } else {
+      character(0)
+    }
+    
+    freezeReactiveValue(input, "cohort_sankey_start_node")
+    updateSelectizeInput(
+      session,
+      "cohort_sankey_start_node",
+      choices = choices,
+      selected = selected_value,
+      server = TRUE
+    )
+  })
+  
+  cohort_sankey_data <- reactive({
+    req(input$cohort_sankey_start_node)
+    
+    make_cohort_sankey_data(
+      event_links = event_links(),
+      start_node = input$cohort_sankey_start_node,
+      depth = input$cohort_depth,
+      top_n_per_node = input$cohort_top_n,
+      min_clients_link = input$cohort_min_clients,
+      max_label_chars = input$cohort_label_chars,
+      adaptive_mode = TRUE,
+      small_cohort_threshold = 150,
+      small_branch_threshold = 20,
+      top_n_large = input$cohort_top_n,
+      min_pct_large = 1,
+      min_clients_large = input$cohort_min_clients
+    )
+  })
+  
+  output$cohort_sankey_kpi_tbl <- renderDT({
+    sk <- cohort_sankey_data()
+    
+    datatable(
+      build_cohort_sankey_kpis(sk),
+      options = list(dom = "t", scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+  
+  output$cohort_sankey_details_tbl <- renderDT({
+    sk <- cohort_sankey_data()
+    req(nrow(sk$details) > 0)
+    
+    datatable(
+      sk$details,
+      options = list(scrollX = TRUE, pageLength = 15),
+      rownames = FALSE
+    )
+  })
+  
+  journey_sankey_data <- reactive({
+    req(input$sankey_start_node)
+    
+    make_recursive_focused_sankey_data(
+      transitions_summary = transitions_summary(),
+      start_node = input$sankey_start_node,
+      depth = input$journey_depth,
+      top_n_per_node = input$journey_top_n,
+      min_clients_link = input$journey_min_clients,
+      max_label_chars = input$journey_label_chars
+    )
+  })
+  
+  # ----------------------------
+  # STABLE FILTER LOGIC
+  # ----------------------------
+  observe({
+    req(filter_nodes_tbl())
+    tbl <- filter_nodes_tbl()
+    mode <- input$node_mode
+    
+    current_brand <- safe_input_value(isolate(input$filter_brand))
+    current_category <- safe_input_value(isolate(input$filter_category))
+    current_node <- safe_input_value(isolate(input$filter_node))
+    
+    # -------------------------
+    # BRAND choices
+    # -------------------------
+    if (mode %in% c("brand_category", "brand")) {
+      brands_base <- tbl %>%
+        filter(!is.na(brand), trimws(brand) != "")
+      
+      if (mode == "brand_category" && current_category != "") {
+        brands_base <- brands_base %>%
+          filter(!is.na(category), trimws(category) != "") %>%
+          filter(norm_text(category) == norm_text(current_category))
+      }
+      
+      available_brands <- brands_base %>%
+        pull(brand) %>%
+        unique() %>%
+        sort()
+      
+      if (!(current_brand %in% available_brands)) current_brand <- ""
+      
+      freezeReactiveValue(input, "filter_brand")
+      updateSelectizeInput(
+        session, "filter_brand",
+        choices = c("Усі" = "", available_brands),
+        selected = current_brand,
+        server = TRUE
+      )
+    } else {
+      freezeReactiveValue(input, "filter_brand")
+      updateSelectizeInput(
+        session, "filter_brand",
+        choices = c("Усі" = ""),
+        selected = "",
+        server = TRUE
+      )
+      current_brand <- ""
+    }
+    
+    # -------------------------
+    # CATEGORY choices
+    # -------------------------
+    if (mode %in% c("brand_category", "category")) {
+      categories_base <- tbl %>%
+        filter(!is.na(category), trimws(category) != "")
+      
+      if (mode == "brand_category" && current_brand != "") {
+        categories_base <- categories_base %>%
+          filter(!is.na(brand), trimws(brand) != "") %>%
+          filter(norm_text(brand) == norm_text(current_brand))
+      }
+      
+      available_categories <- categories_base %>%
+        pull(category) %>%
+        unique() %>%
+        sort()
+      
+      if (!(current_category %in% available_categories)) current_category <- ""
+      
+      freezeReactiveValue(input, "filter_category")
+      updateSelectizeInput(
+        session, "filter_category",
+        choices = c("Усі" = "", available_categories),
+        selected = current_category,
+        server = TRUE
+      )
+    } else {
+      freezeReactiveValue(input, "filter_category")
+      updateSelectizeInput(
+        session, "filter_category",
+        choices = c("Усі" = ""),
+        selected = "",
+        server = TRUE
+      )
+      current_category <- ""
+    }
+    
+    # -------------------------
+    # NODE choices
+    # -------------------------
+    nodes_base <- tbl
+    
+    if (mode %in% c("brand_category", "brand") && current_brand != "") {
+      nodes_base <- nodes_base %>%
+        filter(!is.na(brand), trimws(brand) != "") %>%
+        filter(norm_text(brand) == norm_text(current_brand))
+    }
+    
+    if (mode %in% c("brand_category", "category") && current_category != "") {
+      nodes_base <- nodes_base %>%
+        filter(!is.na(category), trimws(category) != "") %>%
+        filter(norm_text(category) == norm_text(current_category))
+    }
+    
+    available_nodes <- nodes_base %>%
+      pull(node_label) %>%
+      unique() %>%
+      sort()
+    
+    if (!(current_node %in% available_nodes)) current_node <- ""
+    
+    freezeReactiveValue(input, "filter_node")
+    updateSelectizeInput(
+      session, "filter_node",
+      choices = c("Усі" = "", available_nodes),
+      selected = current_node,
+      server = TRUE
+    )
+  })
+  
+  
+  
+  observe({
+    choices <- filtered_sankey_choices()
+    current_selected <- isolate(input$sankey_start_node)
+    
+    selected_value <- if (!is.null(current_selected) &&
+                          length(current_selected) > 0 &&
+                          current_selected %in% choices) {
+      current_selected
+    } else if (length(choices) > 0) {
+      choices[1]
+    } else {
+      character(0)
+    }
+    
+    freezeReactiveValue(input, "sankey_start_node")
+    updateSelectizeInput(
+      session,
+      "sankey_start_node",
+      choices = choices,
+      selected = selected_value,
+      server = TRUE
+    )
+  })
+  
+  output$from_tbl <- renderDT({
+    req(transitions_summary())
+    tbl_nodes <- filtered_from_choices()
+    
+    validate(
+      need(nrow(transitions_summary()) > 0, "Немає переходів для побудови таблиці. Перевірте дані або лаги."),
+      need(nrow(tbl_nodes) > 0, "За поточними фільтрами немає жодного вузла")
+    )
+    
+    selected_nodes <- tbl_nodes$node_label
+    
+    tbl <- transitions_summary() %>%
+      filter(from %in% selected_nodes) %>%
+      arrange(desc(clients), desc(transitions_n))
+    
+    validate(
+      need(nrow(tbl) > 0, "За поточними фільтрами переходів не знайдено")
+    )
+    
+    datatable(
+      tbl,
+      options = list(scrollX = TRUE, pageLength = 20),
+      rownames = FALSE
+    )
+  })
+  
+  output$replenishment_tbl <- renderDT({
+    datatable(replenishment_summary(), options = list(scrollX = TRUE, pageLength = 20))
+  })
+  
+  output$journey_sankey_plot <- renderSankeyNetwork({
+    sk <- journey_sankey_data()
+    req(nrow(sk$nodes) > 0, nrow(sk$links) > 0)
+    
+    colour_scale <- 'd3.scaleOrdinal()
+      .domain(["level_0", "level_1", "level_2", "level_3", "level_4", "level_5", "level_6"])
+      .range(["#2563EB", "#60A5FA", "#F59E0B", "#34D399", "#F472B6", "#A78BFA", "#9CA3AF"])'
+    
+    sankeyNetwork(
+      Links = sk$links,
+      Nodes = sk$nodes,
+      Source = "source",
+      Target = "target",
+      Value = "value",
+      NodeID = "name",
+      NodeGroup = "level",
+      fontSize = 12,
+      nodeWidth = 30,
+      nodePadding = 22,
+      colourScale = colour_scale
+    )
+  })
+  
+  output$cohort_sankey_plot <- renderSankeyNetwork({
+    sk <- cohort_sankey_data()
+    
+    req(nrow(sk$nodes) > 0, nrow(sk$links) > 0)
+    
+    colour_scale <- 'd3.scaleOrdinal()
+    .domain(["level_0", "level_1", "level_2", "level_3", "level_4", "level_5", "level_6"])
+    .range(["#2563EB", "#60A5FA", "#F59E0B", "#34D399", "#F472B6", "#A78BFA", "#9CA3AF"])'
+    
+    sankeyNetwork(
+      Links = sk$links,
+      Nodes = sk$nodes,
+      Source = "source",
+      Target = "target",
+      Value = "value",
+      NodeID = "name",
+      NodeGroup = "level",
+      fontSize = 11,
+      nodeWidth = 26,
+      nodePadding = 24,
+      sinksRight = FALSE,
+      colourScale = colour_scale
+    )
+  })
+  
+  output$journey_nodes_tbl <- renderDT({
+    sk <- journey_sankey_data()
+    req(nrow(sk$nodes) > 0)
+    
+    datatable(
+      sk$nodes %>% select(level, name, full_name),
+      options = list(scrollX = TRUE, pageLength = 10),
+      rownames = FALSE
+    )
+  })
+  
+  output$cohort_sankey_nodes_tbl <- renderDT({
+    sk <- cohort_sankey_data()
+    req(nrow(sk$nodes) > 0)
+    
+    datatable(
+      sk$nodes %>% select(level, name, full_name),
+      options = list(scrollX = TRUE, pageLength = 10),
+      rownames = FALSE
+    )
+  })
+  
+  
+  output$cohort_kpi_tbl <- renderDT({
+    datatable(
+      cohort_kpis(),
+      options = list(dom = "t", scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+  
+  output$cohort_heatmap <- renderPlot({
+    req(nrow(cohort_data()$long) > 0)
+    plot_cohort_heatmap(cohort_data()$long)
+  })
+  
+  output$cohort_tbl <- renderDT({
+    datatable(
+      cohort_data()$wide,
+      options = list(scrollX = TRUE, pageLength = 12),
+      rownames = FALSE
+    )
+  })
+  
+  output$cohort_sankey_plot_ui <- renderUI({
+    sk <- cohort_sankey_data()
+    
+    dynamic_height <- calc_sankey_height(sk$nodes)
+    
+    sankeyNetworkOutput(
+      "cohort_sankey_plot",
+      height = paste0(dynamic_height, "px")
+    )
+  })
+  
+  output$cohort_sankey_mode_text <- renderUI({
+    sk <- cohort_sankey_data()
+    
+    msg <- if (!is.null(sk$display_message)) sk$display_message else ""
+    
+    if (msg == "") return(NULL)
+    
+    div(
+      style = paste(
+        "padding:10px 12px;",
+        "background:#F8FAFC;",
+        "border:1px solid #E2E8F0;",
+        "border-radius:8px;",
+        "color:#334155;"
+      ),
+      HTML(msg)
+    )
+  })
+  
+  output$cohort_sankey_other_details_tbl <- renderDT({
+    sk <- cohort_sankey_data()
+    
+    req(!is.null(sk$other_details), nrow(sk$other_details) > 0)
+    
+    datatable(
+      sk$other_details,
+      options = list(scrollX = TRUE, pageLength = 10),
+      rownames = FALSE
+    )
+  })
+  
+  output$lag_plot <- renderPlot({
+    req(nrow(item_transitions()) > 0)
+    
+    ggplot(item_transitions(), aes(x = lag_days)) +
+      geom_histogram(bins = 30) +
+      labs(
+        title = "Розподіл часу до наступної покупки",
+        x = "Кількість днів",
+        y = "Кількість переходів"
+      ) +
+      theme_minimal(base_size = 13)
+  })
+  
+  output$audit_metrics_tbl <- renderDT({
+    datatable(
+      audit_data()$metrics,
+      options = list(dom = "t", scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+  
+  output$audit_missing_tbl <- renderDT({
+    datatable(
+      audit_data()$missing_tbl,
+      options = list(dom = "t", scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+  
+  output$audit_client_activity_summary_tbl <- renderDT({
+    datatable(
+      audit_data()$client_activity_summary,
+      options = list(dom = "t", scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+  
+  output$audit_category_top_tbl <- renderDT({
+    datatable(
+      audit_data()$category_top %>% slice_head(n = 20),
+      options = list(pageLength = 10, scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+  
+  output$audit_brand_top_tbl <- renderDT({
+    datatable(
+      audit_data()$brand_top %>% slice_head(n = 20),
+      options = list(pageLength = 10, scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+}
+
+shinyApp(ui, server)

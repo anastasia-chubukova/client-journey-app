@@ -1,0 +1,27 @@
+# ---- Пакети ----
+library(shiny)
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(recommenderlab)
+library(purrr)
+library(tibble)
+library(openxlsx)
+library(tools)
+library(rsconnect)
+
+getwd()
+list.files()
+
+
+library(rsconnect)
+rsconnect::deployApp(getwd())
+
+library(rsconnect)
+
+rsconnect::deployApp(
+  appDir = ".",
+  appName = "transitions_app"
+)
+
+rsconnect::setAccountInfo(name='loyaltylabs', token='5315CCA825A5A1C2C16B92DA87A2B08F', secret='2Rb3OO9kirWt8KCXzqko+phDV+FVei2/iV+4x0c5')
