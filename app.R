@@ -150,37 +150,43 @@ safe_parse_numeric <- function(x) {
 
 prepare_events <- function(df, node_mode = "brand_category", basket_mode = c("main_item", "all_items")) {
   basket_mode <- match.arg(basket_mode)
-  
   sum_col <- detect_sum_column(df)
   
+  # один раз приводимо типи
   df_prepared <- df %>%
-    mutate(
+    transmute(
       client_id = as.character(client_id),
       transaction_id = as.character(transaction_id),
-      transaction_date = safe_parse_date(transaction_date)
+      transaction_date = transaction_date,
+      brand = coalesce(as.character(Бренд), "Unknown"),
+      product_name = coalesce(as.character(product_name), "Unknown"),
+      item_sum = if (!is.null(sum_col)) safe_parse_numeric(.data[[sum_col]]) else NA_real_
     ) %>%
     filter(
       !is.na(client_id), trimws(client_id) != "",
       !is.na(transaction_id), trimws(transaction_id) != "",
       !is.na(transaction_date)
     ) %>%
-    make_node(node_mode)
+    mutate(
+      node = case_when(
+        node_mode == "category" ~ product_name,
+        node_mode == "brand" ~ brand,
+        TRUE ~ paste(brand, product_name, sep = " | ")
+      )
+    )
   
-  # Якщо є колонка суми і режим main_item — залишаємо лише найдорожчий товар у транзакції
+  # режим: головний товар кошика
   if (!is.null(sum_col) && basket_mode == "main_item") {
-    df_prepared <- df_prepared %>%
-      mutate(
-        item_sum = safe_parse_numeric(.data[[sum_col]])
-      ) %>%
-      mutate(
-        item_sum = ifelse(is.na(item_sum), -Inf, item_sum)
-      ) %>%
+    out <- df_prepared %>%
+      mutate(item_sum = dplyr::coalesce(item_sum, -Inf)) %>%
       group_by(client_id, transaction_id, transaction_date) %>%
-      arrange(desc(item_sum), node, .by_group = TRUE) %>%
-      slice(1) %>%
+      slice_max(order_by = item_sum, n = 1, with_ties = FALSE) %>%
       ungroup() %>%
-      mutate(
-        basket_nodes = map(node, ~ .x),
+      transmute(
+        client_id,
+        transaction_id,
+        transaction_date,
+        basket_nodes = purrr::map(node, \(x) x),
         basket_label = node
       ) %>%
       arrange(client_id, transaction_date, transaction_id) %>%
@@ -188,17 +194,16 @@ prepare_events <- function(df, node_mode = "brand_category", basket_mode = c("ma
       mutate(step = row_number()) %>%
       ungroup()
     
-    return(df_prepared)
+    return(out)
   }
   
-  # Стара логіка: всі товари кошика
+  # режим: усі товари кошика
   df_prepared %>%
     distinct(client_id, transaction_id, transaction_date, node) %>%
-    arrange(client_id, transaction_date, transaction_id, node) %>%
     group_by(client_id, transaction_id, transaction_date) %>%
     summarise(
-      basket_nodes = list(sort(unique(node))),
-      basket_label = paste(sort(unique(node)), collapse = " + "),
+      basket_nodes = list(sort(node)),
+      basket_label = paste(sort(node), collapse = " + "),
       .groups = "drop"
     ) %>%
     arrange(client_id, transaction_date, transaction_id) %>%
@@ -224,20 +229,38 @@ build_transitions <- function(events, min_days = 0, max_days = 365) {
 }
 
 build_item_transitions <- function(transitions_df) {
-  transitions_df %>%
-    rowwise() %>%
-    mutate(
-      pair_tbl = list(
-        expand_grid(
-          from = unlist(basket_nodes),
-          to = unlist(next_nodes)
-        )
-      )
+  if (nrow(transitions_df) == 0) {
+    return(tibble::tibble(
+      client_id = character(),
+      lag_days = numeric(),
+      from = character(),
+      to = character()
+    ))
+  }
+  
+  purrr::map_dfr(seq_len(nrow(transitions_df)), function(i) {
+    from_nodes <- transitions_df$basket_nodes[[i]]
+    to_nodes   <- transitions_df$next_nodes[[i]]
+    
+    if (length(from_nodes) == 0 || length(to_nodes) == 0) {
+      return(NULL)
+    }
+    
+    out <- tidyr::expand_grid(
+      from = from_nodes,
+      to   = to_nodes
     ) %>%
-    ungroup() %>%
-    select(client_id, lag_days, pair_tbl) %>%
-    unnest(pair_tbl) %>%
-    filter(!is.na(from), !is.na(to), from != to)
+      filter(!is.na(from), !is.na(to), from != to)
+    
+    if (nrow(out) == 0) return(NULL)
+    
+    out %>%
+      mutate(
+        client_id = transitions_df$client_id[i],
+        lag_days  = transitions_df$lag_days[i],
+        .before = 1
+      )
+  })
 }
 
 summarise_item_transitions <- function(item_transitions) {
@@ -1193,7 +1216,7 @@ build_client_profile_tbl <- function(df) {
     mutate(
       client_id = as.character(client_id),
       transaction_id = as.character(transaction_id),
-      transaction_date = safe_parse_date(transaction_date)
+      #transaction_date = safe_parse_date(transaction_date)
     ) %>%
     filter(!is.na(client_id), trimws(client_id) != "")
   
@@ -1212,7 +1235,7 @@ build_client_profile_tbl <- function(df) {
   
   if (!is.null(sum_col)) {
     money_tbl <- df2 %>%
-      mutate(item_sum = safe_parse_numeric(.data[[sum_col]])) %>%
+      mutate(item_sum = item_sum_parsed) %>%
       group_by(client_id) %>%
       summarise(
         total_sum = round(sum(item_sum, na.rm = TRUE), 2),
@@ -2388,10 +2411,10 @@ ui <- secure_app(
 
 
 
+
 server <- function(input, output, session) {
-  res_auth <- secure_server(
-    check_credentials = check_credentials(credentials)
-  )
+  res_auth <- secure_server(check_credentials = check_credentials(credentials))
+  waiter_hide()
   updating_filters <- reactiveVal(FALSE)
   is_loading <- reactiveVal(FALSE)
   loaded_data <- reactiveVal(NULL)
@@ -2422,16 +2445,26 @@ server <- function(input, output, session) {
   })
   
   prepare_cleaned_data <- function(df) {
-    client_col <- detect_client_id_column(df)
+    sum_col <- detect_sum_column(df)
     
-    if (is.null(client_col)) {
-      stop("❌ Не знайдено колонку client_id. ")
+    df2 <- df %>%
+      mutate(
+        client_id = as.character(client_id),
+        transaction_id = as.character(transaction_id),
+        transaction_date = safe_parse_date(transaction_date),
+        product_name = as.character(product_name),
+        Бренд = as.character(Бренд)
+      )
+    
+    if (!is.null(sum_col)) {
+      df2 <- df2 %>%
+        mutate(item_sum_parsed = safe_parse_numeric(.data[[sum_col]]))
+    } else {
+      df2 <- df2 %>%
+        mutate(item_sum_parsed = NA_real_)
     }
     
-    df %>%
-      mutate(
-        client_id = trimws(as.character(.data[[client_col]]))
-      )
+    df2
   }
   
   show_global_loader <- function(text = "Завантажуємо та обробляємо дані...") {
@@ -2689,7 +2722,7 @@ server <- function(input, output, session) {
       mutate(
         client_id = as.character(client_id),
         transaction_id = as.character(transaction_id),
-        transaction_date = safe_parse_date(transaction_date)
+       
       ) %>%
       filter(
         !is.na(client_id), trimws(client_id) != "",
@@ -2706,7 +2739,7 @@ server <- function(input, output, session) {
     }
     
     df2 %>%
-      mutate(item_sum = safe_parse_numeric(.data[[sum_col]])) %>%
+      mutate(item_sum = item_sum_parsed) %>%
       group_by(client_id, transaction_id, transaction_date) %>%
       summarise(
         check_sum = sum(item_sum, na.rm = TRUE),
@@ -3879,18 +3912,91 @@ server <- function(input, output, session) {
     )
   })
   
+  summarise_item_transitions_fast <- function(transitions_df) {
+    if (nrow(transitions_df) == 0) {
+      return(tibble::tibble(
+        from = character(),
+        to = character(),
+        clients = integer(),
+        transitions_n = integer(),
+        avg_lag_days = numeric(),
+        median_lag_days = numeric(),
+        from_clients = integer(),
+        conversion_from_clients = numeric()
+      ))
+    }
+    
+    pair_rows <- purrr::map_dfr(seq_len(nrow(transitions_df)), function(i) {
+      from_nodes <- transitions_df$basket_nodes[[i]]
+      to_nodes   <- transitions_df$next_nodes[[i]]
+      
+      if (length(from_nodes) == 0 || length(to_nodes) == 0) {
+        return(NULL)
+      }
+      
+      tidyr::expand_grid(
+        from = from_nodes,
+        to   = to_nodes
+      ) %>%
+        filter(!is.na(from), !is.na(to), from != to) %>%
+        mutate(
+          client_id = transitions_df$client_id[i],
+          lag_days  = transitions_df$lag_days[i]
+        )
+    })
+    
+    from_base <- pair_rows %>%
+      distinct(client_id, from) %>%
+      count(from, name = "from_clients")
+    
+    pair_rows %>%
+      group_by(from, to) %>%
+      summarise(
+        clients = n_distinct(client_id),
+        transitions_n = n(),
+        avg_lag_days = round(mean(lag_days, na.rm = TRUE), 1),
+        median_lag_days = round(median(lag_days, na.rm = TRUE), 1),
+        .groups = "drop"
+      ) %>%
+      left_join(from_base, by = "from") %>%
+      mutate(conversion_from_clients = round(100 * clients / from_clients, 2)) %>%
+      arrange(desc(clients), desc(transitions_n))
+  }
+  
   observeEvent(input$file, {
+    
+    
     req(input$file)
     
-    file_path <- input$file$datapath
-    show_global_loader("Завантажуємо та обробляємо дані.")
+    # 1. Створюємо об'єкт waiter (вказуємо html та колір)
+    # Це перекриє весь екран незалежно від вкладки
+    w <- Waiter$new(
+      html = tagList(
+        spin_fading_circles(),
+        h3("Завантаження та обробка даних...", style = "color: white; margin-top: 20px;"),
+        p("Будь ласка, зачекайте.", style = "color: white;")
+      ),
+      color = "#2c3e50"
+    )
     
+    # 2. Показуємо його
+    w$show()
+    
+    # 3. Використовуємо tryCatch для безпеки
     tryCatch({
+      # ВАЖЛИВО: Невелика затримка, щоб UI встиг "прогрузити" вікно waiter
+      # без цього воно може просто не встигнути з'явитися до початку фрізу
+      Sys.sleep(0.5) 
+      
+      file_path <- input$file$datapath
       df_raw <- read_input_data(file_path)
       
       if (nrow(df_raw) == 0) {
         stop("Файл порожній")
       }
+      
+      # Оновлюємо текст повідомлення прямо в процесі (опціонально)
+      w$update(html = tagList(spin_fading_circles(), h3("Очищення та аналіз подій...")))
       
       df_clean <- prepare_cleaned_data(df_raw)
       
@@ -3899,6 +4005,8 @@ server <- function(input, output, session) {
         node_mode = input$node_mode,
         basket_mode = input$basket_mode
       )
+      
+      w$update(html = tagList(spin_fading_circles(), h3("Будуємо ланцюжки переходів...")))
       
       lnk <- build_event_links(
         ev,
@@ -3920,10 +4028,19 @@ server <- function(input, output, session) {
           lag_days
         )
       
-      it <- build_item_transitions(tr_raw)
-      tr_sum <- summarise_item_transitions(it)
+      w$update(html = tagList(spin_fading_circles(), h3("Підготовка фінальних звітів...")))
+      
+      if (nrow(tr_raw) > 100000) {
+        showNotification(
+          "Дані дуже великі: використовуємо швидкий режим побудови переходів.",
+          type = "message",
+          duration = 6
+        )
+      }
+      tr_sum <- summarise_item_transitions_fast(tr_raw)
       aud <- build_data_audit(df_clean)
       
+      # Записуємо результати в реактивні змінні
       events_data_val(ev)
       event_links_val(lnk)
       transitions_summary_val(tr_sum)
@@ -3933,6 +4050,7 @@ server <- function(input, output, session) {
       cleaned_data_val(df_clean)
       
     }, error = function(e) {
+      # Скидаємо дані у разі помилки
       loaded_data(NULL)
       cleaned_data_val(NULL)
       events_data_val(NULL)
@@ -3947,7 +4065,9 @@ server <- function(input, output, session) {
       )
       
     }, finally = {
-      hide_global_loader()
+      # 4. Приховуємо вікно в будь-якому випадку
+      w$hide()
+      waiter_hide()
     })
   })
   
