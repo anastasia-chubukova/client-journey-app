@@ -5,7 +5,7 @@ account: loyaltylabs
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
 appId: 16893464
-bundleId: 11798467
+bundleId: 11820353
 url: https://loyaltylabs.shinyapps.io/transitions_app/
 version: 1
 asMultiple: FALSE

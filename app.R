@@ -13,6 +13,7 @@ library(bslib)
 library(waiter)
 library(later)
 library(shinymanager)
+library(openxlsx)
 
 options(shiny.maxRequestSize = 500 * 1024^2)
 
@@ -112,12 +113,17 @@ safe_parse_date <- function(x) {
 make_node <- function(df, mode = "brand_category") {
   df %>%
     mutate(
-      brand = coalesce(as.character(Бренд), "Unknown"),
-      product_name = coalesce(as.character(product_name), "Unknown"),
+      brand = if ("brand" %in% names(.)) coalesce(as.character(brand), "") else "",
+      product_name = if ("product_name" %in% names(.)) coalesce(as.character(product_name), "") else "",
+      brand = trimws(brand),
+      product_name = trimws(product_name),
       node = case_when(
-        mode == "category" ~ product_name,
-        mode == "brand" ~ brand,
-        TRUE ~ paste(brand, product_name, sep = " | ")
+        mode == "category" ~ ifelse(product_name == "", "Unknown category", product_name),
+        mode == "brand" ~ ifelse(brand == "", "Unknown brand", brand),
+        mode == "brand_category" & brand != "" & product_name != "" ~ paste(brand, product_name, sep = " | "),
+        mode == "brand_category" & brand != "" & product_name == "" ~ brand,
+        mode == "brand_category" & brand == "" & product_name != "" ~ product_name,
+        TRUE ~ "Unknown"
       )
     )
 }
@@ -150,7 +156,6 @@ safe_parse_numeric <- function(x) {
 
 prepare_events <- function(df, node_mode = "brand_category", basket_mode = c("main_item", "all_items")) {
   basket_mode <- match.arg(basket_mode)
-  
   sum_col <- detect_sum_column(df)
   
   df_prepared <- df %>%
@@ -164,34 +169,39 @@ prepare_events <- function(df, node_mode = "brand_category", basket_mode = c("ma
       !is.na(transaction_id), trimws(transaction_id) != "",
       !is.na(transaction_date)
     ) %>%
-    make_node(node_mode)
+    make_node(node_mode) %>%
+    mutate(row_id_internal = row_number())
   
-  # Якщо є колонка суми і режим main_item — залишаємо лише найдорожчий товар у транзакції
-  if (!is.null(sum_col) && basket_mode == "main_item") {
-    df_prepared <- df_prepared %>%
-      mutate(
-        item_sum = safe_parse_numeric(.data[[sum_col]])
-      ) %>%
-      mutate(
-        item_sum = ifelse(is.na(item_sum), -Inf, item_sum)
-      ) %>%
-      group_by(client_id, transaction_id, transaction_date) %>%
-      arrange(desc(item_sum), node, .by_group = TRUE) %>%
-      slice(1) %>%
-      ungroup() %>%
-      mutate(
-        basket_nodes = map(node, ~ .x),
-        basket_label = node
-      ) %>%
-      arrange(client_id, transaction_date, transaction_id) %>%
-      group_by(client_id) %>%
-      mutate(step = row_number()) %>%
-      ungroup()
+  if (basket_mode == "main_item") {
+    if (is.null(sum_col)) {
+      stop("Для режиму 'Головний товар' не знайдено колонку з ціною/сумою.")
+    }
     
-    return(df_prepared)
+    return(
+      df_prepared %>%
+        mutate(item_sum = safe_parse_numeric(.data[[sum_col]])) %>%
+        group_by(client_id, transaction_id, transaction_date) %>%
+        summarise(
+          basket_nodes = list(sort(unique(node))),
+          basket_label = {
+            valid <- which(!is.na(item_sum))
+            if (length(valid) == 0) {
+              sort(unique(node))[1]
+            } else {
+              idx <- valid[which.max(item_sum[valid])]
+              node[idx]
+            }
+          },
+          .groups = "drop"
+        ) %>%
+        mutate(basket_nodes = map(basket_label, ~ .x)) %>%
+        arrange(client_id, transaction_date, transaction_id) %>%
+        group_by(client_id) %>%
+        mutate(step = row_number()) %>%
+        ungroup()
+    )
   }
   
-  # Стара логіка: всі товари кошика
   df_prepared %>%
     distinct(client_id, transaction_id, transaction_date, node) %>%
     arrange(client_id, transaction_date, transaction_id, node) %>%
@@ -223,8 +233,8 @@ build_transitions <- function(events, min_days = 0, max_days = 365) {
     )
 }
 
-build_item_transitions <- function(transitions_df) {
-  transitions_df %>%
+build_item_transitions <- function(transitions_df, keep_self_transitions = TRUE) {
+  out <- transitions_df %>%
     rowwise() %>%
     mutate(
       pair_tbl = list(
@@ -237,7 +247,13 @@ build_item_transitions <- function(transitions_df) {
     ungroup() %>%
     select(client_id, lag_days, pair_tbl) %>%
     unnest(pair_tbl) %>%
-    filter(!is.na(from), !is.na(to), from != to)
+    filter(!is.na(from), !is.na(to))
+  
+  if (!keep_self_transitions) {
+    out <- out %>% filter(from != to)
+  }
+  
+  out
 }
 
 summarise_item_transitions <- function(item_transitions) {
@@ -371,8 +387,8 @@ build_data_audit <- function(df) {
       transaction_id = as.character(transaction_id),
       transaction_date_raw = as.character(transaction_date),
       transaction_date_parsed = safe_parse_date(transaction_date),
-      product_name = as.character(product_name),
-      Бренд = as.character(Бренд)
+      product_name = if ("product_name" %in% names(.)) as.character(product_name) else NA_character_,
+      brand = if ("brand" %in% names(.)) as.character(brand) else NA_character_
     )
   
   if (!is.null(sum_col)) {
@@ -393,7 +409,7 @@ build_data_audit <- function(df) {
   clients_n <- n_distinct(df2$client_id[!is.na(df2$client_id) & trimws(df2$client_id) != ""])
   transactions_n <- n_distinct(df2$transaction_id[!is.na(df2$transaction_id) & trimws(df2$transaction_id) != ""])
   categories_n <- n_distinct(df2$product_name[!is.na(df2$product_name) & trimws(df2$product_name) != ""])
-  brands_n <- n_distinct(df2$Бренд[!is.na(df2$Бренд) & trimws(df2$Бренд) != ""])
+  brands_n <- n_distinct(df2$brand[!is.na(df2$brand) & trimws(df2$brand) != ""])
   
   valid_dates <- df2$transaction_date_parsed[!is.na(df2$transaction_date_parsed)]
   min_date <- if (length(valid_dates) > 0) min(valid_dates) else NA
@@ -470,14 +486,14 @@ build_data_audit <- function(df) {
       sum(is.na(df2$transaction_id) | trimws(df2$transaction_id) == ""),
       sum(is.na(df2$transaction_date_raw) | trimws(df2$transaction_date_raw) == ""),
       sum(is.na(df2$product_name) | trimws(df2$product_name) == ""),
-      sum(is.na(df2$Бренд) | trimws(df2$Бренд) == "")
+      sum(is.na(df2$brand) | trimws(df2$brand) == "")
     ),
     `Унікальних значень` = c(
       n_distinct(df2$client_id[!is.na(df2$client_id) & trimws(df2$client_id) != ""]),
       n_distinct(df2$transaction_id[!is.na(df2$transaction_id) & trimws(df2$transaction_id) != ""]),
       n_distinct(df2$transaction_date_raw[!is.na(df2$transaction_date_raw) & trimws(df2$transaction_date_raw) != ""]),
       n_distinct(df2$product_name[!is.na(df2$product_name) & trimws(df2$product_name) != ""]),
-      n_distinct(df2$Бренд[!is.na(df2$Бренд) & trimws(df2$Бренд) != ""])
+      n_distinct(df2$brand[!is.na(df2$brand) & trimws(df2$brand) != ""])
     )
   ) %>%
     mutate(`% пропусків` = round(100 * Пропущено / records_n, 2))
@@ -521,8 +537,8 @@ build_data_audit <- function(df) {
     count(product_name, sort = TRUE, name = "Кількість записів")
   
   brand_top <- df2 %>%
-    filter(!is.na(Бренд), trimws(Бренд) != "") %>%
-    count(Бренд, sort = TRUE, name = "Кількість записів")
+    filter(!is.na(brand), trimws(brand) != "") %>%
+    count(brand, sort = TRUE, name = "Кількість записів")
   
   sum_parse_examples <- if (!is.null(sum_col)) {
     df2 %>%
@@ -1978,10 +1994,50 @@ ui <- secure_app(
           ),
           selected = "main_item"
         ),
-        numericInput("min_days", "Мін. лаг (днів)", 1, min = 0),
-        numericInput("max_days", "Макс. лаг (днів)", 365, min = 1),
-        numericInput("max_steps", "Макс. кроків у маршруті", 6, min = 2, max = 10),
-        numericInput("top_n", "Top переходів / лінків", 100, min = 10, max = 500),
+        numericInput(
+          "min_days",
+          "Мінімальний інтервал між покупками, днів",
+          value = 1,
+          min = 0
+        ),
+        
+        checkboxInput(
+          "use_max_days",
+          "Обмежувати маршрут максимальним інтервалом між покупками",
+          value = FALSE
+        ),
+        
+        conditionalPanel(
+          condition = "input.use_max_days == true",
+          numericInput(
+            "max_days",
+            "Вважати покупки пов’язаними, якщо між ними не більше ніж, днів",
+            value = 365,
+            min = 1
+          )
+        ),
+        
+        div(
+          class = "info-card",
+          style = "margin-top: 10px; padding: 12px 14px;",
+          HTML(
+            "Якщо інтервал між покупками більший за вказане значення, такий перехід
+     не включається в маршрут. Це допомагає відділити пов’язані покупки
+     від далеких повторних покупок або нового циклу поведінки."
+          )
+        ),
+        #numericInput("max_steps", "Макс. кроків у маршруті", 6, min = 2, max = 10),
+        radioButtons(
+          "top_n_mode",
+          "Рівень деталізації",
+          choices = c(
+            "Основні переходи" = 20,
+            "Баланс" = 100,
+            "Детально" = 200,
+            "Максимально" = 500
+          ),
+          selected = 100
+        ),
         hr()
       ),
       mainPanel(
@@ -2036,34 +2092,42 @@ ui <- secure_app(
             
             h4("Основні метрики"),
             div(
+              id = "audit_metrics_tbl_block",
               class = "table-card",
-              DTOutput("audit_metrics_tbl")),
+              DTOutput("audit_metrics_tbl")
+            ),
             br(),
             h4("Якість даних по полях"),
             div(
+              id = "audit_missing_tbl_block",
               class = "table-card",
-              DTOutput("audit_missing_tbl")),
+              DTOutput("audit_missing_tbl")
+            ),
             br(),
             h4("Активність клієнтів"),
             div(
+              id = "audit_client_activity_summary_tbl_block",
               class = "table-card",
-              DTOutput("audit_client_activity_summary_tbl")),
+              DTOutput("audit_client_activity_summary_tbl")
+            ),
             br(),
             h4("Топ категорій"),
             div(
               class = "table-card",
-              DTOutput("audit_category_top_tbl")),
+              DTOutput("audit_category_top_tbl")
+            ),
             br(),
             h4("Топ брендів"),
             div(
               class = "table-card",
-              DTOutput("audit_brand_top_tbl")),
+              DTOutput("audit_brand_top_tbl")
+            ),
             br(),
             h4("Проблемні значення в колонці суми"),
             div(
               class = "table-card",
-              uiOutput("audit_sum_parse_examples"))
-          ),
+              uiOutput("audit_sum_parse_examples")
+            )),
           
           tabPanel(
             "Шлях після покупки",
@@ -2097,10 +2161,7 @@ ui <- secure_app(
                 3,
                 numericInput("cohort_depth", "Глибина маршруту", 3, min = 1, max = 6)
               ),
-              column(
-                3,
-                numericInput("cohort_top_n", "Топ кошиків з кожного вузла", 7, min = 1, max = 10)
-              ),
+              
               column(
                 3,
                 numericInput("cohort_min_clients", "Мін. клієнтів у зв'язку", 1, min = 1, max = 100)
@@ -2111,6 +2172,7 @@ ui <- secure_app(
               )
             ),
             br(),
+            
             h4("Короткі висновки"),
             div(
               class = "table-card",
@@ -2118,6 +2180,7 @@ ui <- secure_app(
             br(),
             htmlOutput("cohort_sankey_mode_text"),
             br(),
+            
             div(
               id = "cohort_sankey_block",
               uiOutput("cohort_sankey_plot_ui")
@@ -2182,7 +2245,7 @@ ui <- secure_app(
               class = "table-card",
               DTOutput("cohort_selected_clients_tbl")),
             br(),
-            downloadButton("download_cohort_selected_clients", "Завантажити CSV")
+            downloadButton("download_cohort_selected_clients", "Завантажити XLSX")
           ),
           tabPanel(
             "Переходи",
@@ -2203,12 +2266,13 @@ ui <- secure_app(
                 maxOptions = 1000,
                 create = FALSE
               )
-            )
-            ,
+            ),
             br(),
+            
             div(
               class = "table-card",
-              DTOutput("from_tbl"))
+              DTOutput("from_tbl")
+            )
           ),
           
           tabPanel(
@@ -2232,7 +2296,7 @@ ui <- secure_app(
             fluidRow(
               column(3, numericInput("journey_depth", "Глибина маршруту", 3, min = 1, max = 6)),
               column(3, numericInput("journey_top_n", "Гілок з кожного вузла", 3, min = 1, max = 8)),
-              column(3, numericInput("journey_min_clients", "Мін. клієнтів у зв'язку", 2, min = 1, max = 100)),
+              column(3, numericInput("journey_min_clients", "Мін. клієнтів у зв'язку", 1, min = 1, max = 100)),
               column(3, numericInput("journey_label_chars", "Довжина підпису", 22, min = 10, max = 50))
             ),
             br(),
@@ -2265,14 +2329,16 @@ ui <- secure_app(
                      "Аналіз повторних покупок та часу між ними. Допомагає зрозуміти регулярність споживання та поведінку клієнтів."
                    ),
                    div(
+                     id = "replenishment_tbl_block",
                      class = "table-card",
-                     DTOutput("replenishment_tbl")))
+                     DTOutput("replenishment_tbl")
+                   ))
+          )
         )
       )
-    )
-  ),
-  head_auth = tags$head(
-    tags$style(HTML("
+    ),
+    head_auth = tags$head(
+      tags$style(HTML("
     body {
       background: #f2ebe3 !important;
       font-family: 'Inter', sans-serif !important;
@@ -2370,21 +2436,22 @@ ui <- secure_app(
       text-align: center !important;
     }
   "))
-  ),
-  
-  # 🔽 Текст і стиль
-  tags_top = div(
-    class = "card-soft",
-    style = "text-align:center;",
-    div(class = "main-title-custom", "Customer Journey Analytics"),
-    div(class = "main-subtitle-custom", "Secure access")
-  ),
-  
-  tags_bottom = div(
-    class = "auth-subtitle",
-    "Secure access"
+    ),
+    
+    # 🔽 Текст і стиль
+    tags_top = div(
+      class = "card-soft",
+      style = "text-align:center;",
+      div(class = "main-title-custom", "Customer Journey Analytics"),
+      div(class = "main-subtitle-custom", "Secure access")
+    ),
+    
+    tags_bottom = div(
+      class = "auth-subtitle",
+      "Secure access"
+    )
   )
-)
+  
 
 
 
@@ -2421,16 +2488,105 @@ server <- function(input, output, session) {
     cleaned_data_val()
   })
   
+  lag_filter_stats <- reactive({
+    req(event_links())
+    
+    lnk <- event_links()
+    
+    total_with_next <- lnk %>%
+      filter(!is.na(next_step), !is.na(lag_days)) %>%
+      nrow()
+    
+    below_min <- lnk %>%
+      filter(!is.na(next_step), !is.na(lag_days), lag_days < input$min_days) %>%
+      nrow()
+    
+    above_max <- if (isTRUE(input$use_max_days)) {
+      lnk %>%
+        filter(!is.na(next_step), !is.na(lag_days), lag_days > input$max_days) %>%
+        nrow()
+    } else {
+      0
+    }
+    
+    kept <- total_with_next - below_min - above_max
+    
+    list(
+      total_with_next = total_with_next,
+      below_min = below_min,
+      above_max = above_max,
+      kept = kept
+    )
+  })
+  
   prepare_cleaned_data <- function(df) {
     client_col <- detect_client_id_column(df)
     
     if (is.null(client_col)) {
-      stop("❌ Не знайдено колонку client_id. ")
+      stop("❌ Не знайдено колонку client_id.")
+    }
+    
+    # transaction_id
+    if (!("transaction_id" %in% names(df))) {
+      tx_candidates <- c("transaction_id", "transaction id", "check_id", "receipt_id", "order_id", "bill_id", "id транзакції")
+      tx_hit <- names(df)[tolower(trimws(names(df))) %in% tx_candidates]
+      if (length(tx_hit) > 0) {
+        df$transaction_id <- df[[tx_hit[1]]]
+      } else {
+        stop("❌ Не знайдено колонку transaction_id.")
+      }
+    }
+    
+    # transaction_date
+    if (!("transaction_date" %in% names(df))) {
+      dt_candidates <- c("transaction_date", "transaction date", "date", "order_date", "check_date", "дата")
+      dt_hit <- names(df)[tolower(trimws(names(df))) %in% dt_candidates]
+      if (length(dt_hit) > 0) {
+        df$transaction_date <- df[[dt_hit[1]]]
+      } else {
+        stop("❌ Не знайдено колонку transaction_date.")
+      }
+    }
+    
+    # brand
+    if (!("brand" %in% names(df))) {
+      brand_candidates <- c("Бренд", "бренд", "brand", "Brand")
+      brand_hit <- names(df)[names(df) %in% brand_candidates]
+      
+      if (length(brand_hit) > 0) {
+        df$brand <- df[[brand_hit[1]]]
+      } else {
+        df$brand <- NA_character_
+      }
+    }
+    
+    # category / product_name
+    if (!("product_name" %in% names(df))) {
+      cat_candidates <- c("product_name", "category", "категорія", "Категорія", "product", "товар", "послуга")
+      cat_hit <- names(df)[tolower(trimws(names(df))) %in% tolower(cat_candidates)]
+      
+      if (length(cat_hit) > 0) {
+        df$product_name <- df[[cat_hit[1]]]
+      } else {
+        df$product_name <- NA_character_
+      }
+    }
+    
+    # перевірка: має бути хоча б один вимір
+    has_brand <- any(!is.na(df$brand) & trimws(as.character(df$brand)) != "")
+    has_category <- any(!is.na(df$product_name) & trimws(as.character(df$product_name)) != "")
+    
+    if (!has_brand && !has_category) {
+      stop("❌ У файлі немає ані колонки бренду, ані колонки категорії/товару.")
     }
     
     df %>%
       mutate(
-        client_id = trimws(as.character(.data[[client_col]]))
+        client_id = trimws(as.character(.data[[client_col]])),
+        transaction_id = trimws(as.character(transaction_id)),
+        transaction_date = as.character(transaction_date),
+        brand = as.character(brand),
+        product_name = as.character(product_name)
       )
   }
   
@@ -2472,23 +2628,75 @@ server <- function(input, output, session) {
     waiter_hide(id = id)
   }
   
-  events_data <- reactive({
-    prepare_events(
-      cleaned_data(),
+  rebuild_analysis <- function() {
+    req(cleaned_data())
+    
+    df_clean <- cleaned_data()
+    
+    ev <- prepare_events(
+      df_clean,
       node_mode = input$node_mode,
       basket_mode = input$basket_mode
     )
+    
+    max_days_val <- if (isTRUE(input$use_max_days)) input$max_days else Inf
+    
+    lnk <- build_event_links(
+      ev,
+      min_days = input$min_days,
+      max_days = max_days_val
+    )
+    
+    tr_raw <- lnk %>%
+      filter(next_valid) %>%
+      transmute(
+        client_id,
+        transaction_id,
+        transaction_date,
+        basket_nodes,
+        basket_label,
+        next_basket,
+        next_nodes,
+        next_date,
+        lag_days
+      )
+    
+    it <- build_item_transitions(
+      tr_raw,
+      keep_self_transitions = TRUE
+    )
+    
+    tr_sum <- summarise_item_transitions(it)
+    aud <- build_data_audit(df_clean)
+    
+    events_data_val(ev)
+    event_links_val(lnk)
+    transitions_summary_val(tr_sum)
+    audit_data_val(aud)
+  }
+  
+  events_data <- reactive({
+    req(events_data_val())
+    events_data_val()
   })
   
   event_links <- reactive({
-    build_event_links(
-      events_data(),
-      min_days = input$min_days,
-      max_days = input$max_days
-    )
+    req(event_links_val())
+    event_links_val()
+  })
+  
+  transitions_summary <- reactive({
+    req(transitions_summary_val())
+    transitions_summary_val()
+  })
+  
+  audit_data <- reactive({
+    req(audit_data_val())
+    audit_data_val()
   })
   
   transitions_raw <- reactive({
+    req(event_links())
     event_links() %>%
       filter(next_valid) %>%
       transmute(
@@ -2505,19 +2713,48 @@ server <- function(input, output, session) {
   })
   
   item_transitions <- reactive({
+    req(transitions_raw())
     build_item_transitions(transitions_raw())
   })
   
   transitions_summary <- reactive({
-    summarise_item_transitions(item_transitions())
+    req(transitions_summary_val())
+    transitions_summary_val()
   })
   
-  filter_nodes_tbl <- reactive({
+  audit_data <- reactive({
+    req(audit_data_val())
+    audit_data_val()
+  })
+  
+  filtered_transition_choices <- reactive({
     req(transitions_summary())
-    nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
-    split_node_fields(nodes, input$node_mode)
+    
+    all_nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
+    all_nodes
   })
   
+  observe({
+    choices <- filtered_transition_choices()
+    current_selected <- isolate(input$filter_node)
+    
+    selected_value <- if (!is.null(current_selected) &&
+                          length(current_selected) > 0 &&
+                          current_selected %in% choices) {
+      current_selected
+    } else {
+      ""
+    }
+    
+    freezeReactiveValue(input, "filter_node")
+    updateSelectizeInput(
+      session,
+      "filter_node",
+      choices = c("Усі" = "", choices),
+      selected = selected_value,
+      server = TRUE
+    )
+  })
   
   
   replenishment_data <- reactive({
@@ -2545,34 +2782,7 @@ server <- function(input, output, session) {
     build_cohort_kpis(cohort_data()$long)
   })
   
-  filtered_from_choices <- reactive({
-    req(filter_nodes_tbl())
-    tbl <- filter_nodes_tbl()
-    mode <- input$node_mode
-    
-    brand_text <- safe_input_value(input$filter_brand)
-    category_text <- safe_input_value(input$filter_category)
-    node_text <- safe_input_value(input$filter_node)
-    
-    if (mode %in% c("brand_category", "brand") && brand_text != "") {
-      tbl <- tbl %>%
-        filter(!is.na(brand), trimws(brand) != "") %>%
-        filter(norm_text(brand) == norm_text(brand_text))
-    }
-    
-    if (mode %in% c("brand_category", "category") && category_text != "") {
-      tbl <- tbl %>%
-        filter(!is.na(category), trimws(category) != "") %>%
-        filter(norm_text(category) == norm_text(category_text))
-    }
-    
-    if (node_text != "") {
-      tbl <- tbl %>%
-        filter(node_label == node_text)
-    }
-    
-    tbl
-  })
+  
   
   filtered_sankey_choices <- reactive({
     req(transitions_summary())
@@ -2633,17 +2843,19 @@ server <- function(input, output, session) {
   cohort_sankey_data <- reactive({
     req(input$cohort_sankey_start_node)
     
+    top_n_val <- 10
+    
     make_cohort_sankey_data(
       event_links = event_links(),
       start_node = input$cohort_sankey_start_node,
       depth = input$cohort_depth,
-      top_n_per_node = input$cohort_top_n,
+      top_n_per_node = top_n_val,
       min_clients_link = input$cohort_min_clients,
       max_label_chars = input$cohort_label_chars,
       adaptive_mode = TRUE,
       small_cohort_threshold = 150,
       small_branch_threshold = 20,
-      top_n_large = input$cohort_top_n,
+      top_n_large = top_n_val,
       min_pct_large = 1,
       min_clients_large = input$cohort_min_clients
     )
@@ -2865,7 +3077,7 @@ server <- function(input, output, session) {
     k <- executive_kpis()
     make_kpi_card(
       title = "Клієнти без повторної покупки",
-      value = paste0(k$one_time_share, "%"),
+      value = paste0(format_big_number(k$one_time_share, 1), "%"),
       subtitle = "Клієнти з 1 покупкою",
       color = "#78aee0"
     )
@@ -3125,10 +3337,16 @@ server <- function(input, output, session) {
   output$download_cohort_selected_clients <- downloadHandler(
     filename = function() {
       mode <- input$cohort_clients_mode %||% "transition"
-      paste0("cohort_", mode, "_clients_", Sys.Date(), ".csv")
+      paste0("cohort_", mode, "_clients_", Sys.Date(), ".xlsx")
     },
     content = function(file) {
-      readr::write_csv(cohort_selected_clients_tbl(), file)
+      tbl <- cohort_selected_clients_tbl() %>%
+        select(-any_of(c("total_sum", "avg_item_sum")))
+      
+      openxlsx::write.xlsx(
+        tbl,
+        file
+      )
     }
   )
   
@@ -3234,123 +3452,47 @@ server <- function(input, output, session) {
   # ----------------------------
   # STABLE FILTER LOGIC
   # ----------------------------
+  
+  
+  
+  filtered_transition_choices <- reactive({
+    req(transitions_summary())
+    
+    all_nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
+    
+    search_txt <- input$transition_search
+    if (is.null(search_txt)) search_txt <- ""
+    search_txt <- trimws(tolower(search_txt))
+    
+    if (search_txt == "") {
+      return(all_nodes)
+    }
+    
+    all_nodes[stringr::str_detect(tolower(all_nodes), fixed(search_txt))]
+  })
+  
   observe({
-    req(filter_nodes_tbl())
-    tbl <- filter_nodes_tbl()
-    mode <- input$node_mode
+    choices <- filtered_transition_choices()
+    current_selected <- isolate(input$filter_node)
     
-    current_brand <- safe_input_value(isolate(input$filter_brand))
-    current_category <- safe_input_value(isolate(input$filter_category))
-    current_node <- safe_input_value(isolate(input$filter_node))
-    
-    # -------------------------
-    # BRAND choices
-    # -------------------------
-    if (mode %in% c("brand_category", "brand")) {
-      brands_base <- tbl %>%
-        filter(!is.na(brand), trimws(brand) != "")
-      
-      if (mode == "brand_category" && current_category != "") {
-        brands_base <- brands_base %>%
-          filter(!is.na(category), trimws(category) != "") %>%
-          filter(norm_text(category) == norm_text(current_category))
-      }
-      
-      available_brands <- brands_base %>%
-        pull(brand) %>%
-        unique() %>%
-        sort()
-      
-      if (!(current_brand %in% available_brands)) current_brand <- ""
-      
-      freezeReactiveValue(input, "filter_brand")
-      updateSelectizeInput(
-        session, "filter_brand",
-        choices = c("Усі" = "", available_brands),
-        selected = current_brand,
-        server = TRUE
-      )
+    selected_value <- if (!is.null(current_selected) &&
+                          length(current_selected) > 0 &&
+                          current_selected %in% choices) {
+      current_selected
     } else {
-      freezeReactiveValue(input, "filter_brand")
-      updateSelectizeInput(
-        session, "filter_brand",
-        choices = c("Усі" = ""),
-        selected = "",
-        server = TRUE
-      )
-      current_brand <- ""
+      ""
     }
-    
-    # -------------------------
-    # CATEGORY choices
-    # -------------------------
-    if (mode %in% c("brand_category", "category")) {
-      categories_base <- tbl %>%
-        filter(!is.na(category), trimws(category) != "")
-      
-      if (mode == "brand_category" && current_brand != "") {
-        categories_base <- categories_base %>%
-          filter(!is.na(brand), trimws(brand) != "") %>%
-          filter(norm_text(brand) == norm_text(current_brand))
-      }
-      
-      available_categories <- categories_base %>%
-        pull(category) %>%
-        unique() %>%
-        sort()
-      
-      if (!(current_category %in% available_categories)) current_category <- ""
-      
-      freezeReactiveValue(input, "filter_category")
-      updateSelectizeInput(
-        session, "filter_category",
-        choices = c("Усі" = "", available_categories),
-        selected = current_category,
-        server = TRUE
-      )
-    } else {
-      freezeReactiveValue(input, "filter_category")
-      updateSelectizeInput(
-        session, "filter_category",
-        choices = c("Усі" = ""),
-        selected = "",
-        server = TRUE
-      )
-      current_category <- ""
-    }
-    
-    # -------------------------
-    # NODE choices
-    # -------------------------
-    nodes_base <- tbl
-    
-    if (mode %in% c("brand_category", "brand") && current_brand != "") {
-      nodes_base <- nodes_base %>%
-        filter(!is.na(brand), trimws(brand) != "") %>%
-        filter(norm_text(brand) == norm_text(current_brand))
-    }
-    
-    if (mode %in% c("brand_category", "category") && current_category != "") {
-      nodes_base <- nodes_base %>%
-        filter(!is.na(category), trimws(category) != "") %>%
-        filter(norm_text(category) == norm_text(current_category))
-    }
-    
-    available_nodes <- nodes_base %>%
-      pull(node_label) %>%
-      unique() %>%
-      sort()
-    
-    if (!(current_node %in% available_nodes)) current_node <- ""
     
     freezeReactiveValue(input, "filter_node")
     updateSelectizeInput(
-      session, "filter_node",
-      choices = c("Усі" = "", available_nodes),
-      selected = current_node,
+      session,
+      "filter_node",
+      choices = c("Усі" = "", choices),
+      selected = selected_value,
       server = TRUE
     )
   })
+  
   
   
   
@@ -3380,41 +3522,47 @@ server <- function(input, output, session) {
   
   output$from_tbl <- renderDT({
     req(transitions_summary())
-    tbl_nodes <- filtered_from_choices()
+    
+    tbl <- transitions_summary()
     
     validate(
-      need(nrow(transitions_summary()) > 0, "Немає переходів для побудови таблиці. Перевірте дані або лаги."),
-      need(nrow(tbl_nodes) > 0, "За поточними фільтрами немає жодного вузла")
+      need(nrow(tbl) > 0, "Немає переходів для побудови таблиці. Перевірте дані або лаги.")
     )
     
-    selected_nodes <- tbl_nodes$node_label
-    
-    tbl <- transitions_summary() %>%
-      filter(from %in% selected_nodes) %>%
-      arrange(desc(clients), desc(transitions_n))
+    if (!is.null(input$filter_node) && input$filter_node != "") {
+      tbl <- tbl %>% filter(from == input$filter_node)
+    }
     
     validate(
-      need(nrow(tbl) > 0, "За поточними фільтрами переходів не знайдено")
+      need(nrow(tbl) > 0, "За поточним фільтром переходів нічого не знайдено.")
     )
+    
+    tbl <- tbl %>%
+      rename(
+        `Звідки` = from,
+        `Куди` = to,
+        `Клієнтів` = clients,
+        `Кількість переходів` = transitions_n,
+        `Сер. лаг, днів` = avg_lag_days,
+        `Медіанний лаг, днів` = median_lag_days,
+        `Клієнтів у стартовому вузлі` = from_clients,
+        `Конверсія, %` = conversion_from_clients
+      ) %>%
+      arrange(desc(`Клієнтів`), desc(`Кількість переходів`))
     
     datatable(
-      tbl %>%
-        rename(
-          `Звідки` = from,
-          `Куди` = to,
-          `Клієнтів` = clients,
-          `Кількість переходів` = transitions_n,
-          `Сер. час до переходу` = avg_lag_days,
-          `Медіанний час` = median_lag_days,
-          `Клієнтів у стартовому вузлі` = from_clients,
-          `Конверсія від стартового вузла, %` = conversion_from_clients
-        ),
-      options = list(scrollX = TRUE, pageLength = 20),
+      tbl,
+      options = list(scrollX = TRUE, pageLength = 15),
       rownames = FALSE
     )
   })
   
   output$replenishment_tbl <- renderDT({
+    
+    show_block_loader("replenishment_tbl_block", "Розраховуємо повторні покупки...")
+    on.exit(hide_block_loader("replenishment_tbl_block"), add = TRUE)
+    
+    req(replenishment_summary())
     
     tbl <- replenishment_summary() %>%
       rename(
@@ -3744,20 +3892,14 @@ server <- function(input, output, session) {
     )
   })
   
-  output$lag_plot <- renderPlot({
-    req(nrow(item_transitions()) > 0)
-    
-    ggplot(item_transitions(), aes(x = lag_days)) +
-      geom_histogram(bins = 30) +
-      labs(
-        title = "Розподіл часу до наступної покупки",
-        x = "Кількість днів",
-        y = "Кількість переходів"
-      ) +
-      theme_minimal(base_size = 13)
-  })
+
   
   output$audit_metrics_tbl <- renderDT({
+    show_block_loader("audit_metrics_tbl_block", "Готуємо метрики аудиту...")
+    on.exit(hide_block_loader("audit_metrics_tbl_block"), add = TRUE)
+    
+    req(audit_data())
+    
     datatable(
       audit_data()$metrics,
       options = list(dom = "t", scrollX = TRUE),
@@ -3766,14 +3908,27 @@ server <- function(input, output, session) {
   })
   
   output$audit_missing_tbl <- renderDT({
+    show_block_loader("audit_missing_tbl_block", "Готуємо метрики аудиту...")
+    on.exit(hide_block_loader("audit_missing_tbl_block"), add = TRUE)
+    
+    req(audit_data())
+    
     datatable(
-      audit_data()$missing_tbl,
+      audit_data()$metrics,
       options = list(dom = "t", scrollX = TRUE),
       rownames = FALSE
     )
   })
   
   output$audit_client_activity_summary_tbl <- renderDT({
+    
+    show_block_loader(
+      "audit_client_activity_summary_tbl_block",
+      "Аналізуємо активність клієнтів..."
+    )
+    on.exit(hide_block_loader("audit_client_activity_summary_tbl_block"), add = TRUE)
+    
+    req(audit_data())
     
     df <- audit_data()$client_activity_summary
     
@@ -3791,6 +3946,7 @@ server <- function(input, output, session) {
       rownames = FALSE
     )
   })
+  
   output$audit_category_top_tbl <- renderDT({
     datatable(
       audit_data()$category_top %>% slice_head(n = 20),
@@ -3879,11 +4035,14 @@ server <- function(input, output, session) {
     )
   })
   
+  
+  
+  
   observeEvent(input$file, {
     req(input$file)
     
     file_path <- input$file$datapath
-    show_global_loader("Завантажуємо та обробляємо дані.")
+    show_global_loader("Завантажуємо файл і готуємо результати...")
     
     tryCatch({
       df_raw <- read_input_data(file_path)
@@ -3894,43 +4053,15 @@ server <- function(input, output, session) {
       
       df_clean <- prepare_cleaned_data(df_raw)
       
-      ev <- prepare_events(
-        df_clean,
-        node_mode = input$node_mode,
-        basket_mode = input$basket_mode
-      )
-      
-      lnk <- build_event_links(
-        ev,
-        min_days = input$min_days,
-        max_days = input$max_days
-      )
-      
-      tr_raw <- lnk %>%
-        filter(next_valid) %>%
-        transmute(
-          client_id,
-          transaction_id,
-          transaction_date,
-          basket_nodes,
-          basket_label,
-          next_basket,
-          next_nodes,
-          next_date,
-          lag_days
-        )
-      
-      it <- build_item_transitions(tr_raw)
-      tr_sum <- summarise_item_transitions(it)
-      aud <- build_data_audit(df_clean)
-      
-      events_data_val(ev)
-      event_links_val(lnk)
-      transitions_summary_val(tr_sum)
-      audit_data_val(aud)
-      
       loaded_data(df_raw)
       cleaned_data_val(df_clean)
+      
+      rebuild_analysis()
+      
+      session$onFlushed(function() {
+        hide_global_loader()
+        showNotification("Файл успішно завантажено. Результати оновлено.", type = "message", duration = 4)
+      }, once = TRUE)
       
     }, error = function(e) {
       loaded_data(NULL)
@@ -3940,16 +4071,44 @@ server <- function(input, output, session) {
       transitions_summary_val(NULL)
       audit_data_val(NULL)
       
+      hide_global_loader()
       showNotification(
         paste("Помилка завантаження:", conditionMessage(e)),
         type = "error",
         duration = 8
       )
-      
-    }, finally = {
-      hide_global_loader()
     })
   })
+  
+  observeEvent(
+    list(
+      input$node_mode,
+      input$basket_mode,
+      input$min_days,
+      input$use_max_days,
+      input$max_days
+    ),
+    {
+      req(cleaned_data())
+      
+      show_global_loader("Оновлюємо розрахунки...")
+      
+      tryCatch({
+        rebuild_analysis()
+        session$onFlushed(function() {
+          hide_global_loader()
+        }, once = TRUE)
+      }, error = function(e) {
+        hide_global_loader()
+        showNotification(
+          paste("Помилка оновлення:", conditionMessage(e)),
+          type = "error",
+          duration = 8
+        )
+      })
+    },
+    ignoreInit = TRUE
+  )
   
   observeEvent(
     list(
