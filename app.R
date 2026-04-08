@@ -3333,7 +3333,8 @@ server <- function(input, output, session) {
       paste0("cohort_clients_", Sys.Date(), ".csv")
     },
     content = function(file) {
-      df <- cohort_selected_clients_tbl()
+      df <- cohort_selected_clients_tbl() %>%
+        dplyr::select(-dplyr::any_of(c("total_sum", "avg_item_sum")))
       
       readr::write_excel_csv(df, file)
     }
