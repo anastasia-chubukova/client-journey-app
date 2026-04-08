@@ -2239,7 +2239,7 @@ ui <- secure_app(
               class = "table-card",
               DTOutput("cohort_selected_clients_tbl")),
             br(),
-            downloadButton("download_cohort_selected_clients", "Завантажити XLSX")
+            downloadButton("download_cohort_selected_clients", "Завантажити CSV")
           ),
           tabPanel(
             "Переходи",
@@ -3330,17 +3330,12 @@ server <- function(input, output, session) {
   
   output$download_cohort_selected_clients <- downloadHandler(
     filename = function() {
-      mode <- input$cohort_clients_mode %||% "transition"
-      paste0("cohort_", mode, "_clients_", Sys.Date(), ".xlsx")
+      paste0("cohort_clients_", Sys.Date(), ".csv")
     },
     content = function(file) {
-      tbl <- cohort_selected_clients_tbl() %>%
-        select(-any_of(c("total_sum", "avg_item_sum")))
+      df <- cohort_selected_clients_tbl()
       
-      openxlsx::write.xlsx(
-        tbl,
-        file
-      )
+      readr::write_excel_csv(df, file)
     }
   )
   
