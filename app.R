@@ -1,3 +1,5 @@
+install.packages("openxlsx")
+
 library(shiny)
 library(readr)
 library(readxl)
