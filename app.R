@@ -13,7 +13,7 @@ library(bslib)
 library(waiter)
 library(later)
 library(shinymanager)
-library(openxlsx)
+
 
 options(shiny.maxRequestSize = 500 * 1024^2)
 
