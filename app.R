@@ -27,7 +27,11 @@ guess_delim <- function(path) {
 
 credentials <- data.frame(
   user = c("client1", "client2", "admin"),
-  password = c("pass123", "pass456", "admin789"),
+  password = c(
+    Sys.getenv("CLIENT1_PASS"),
+    Sys.getenv("CLIENT2_PASS"),
+    Sys.getenv("ADMIN_PASS")
+  ),
   admin = c(FALSE, FALSE, TRUE),
   stringsAsFactors = FALSE
 )
@@ -2027,17 +2031,7 @@ ui <- secure_app(
           )
         ),
         #numericInput("max_steps", "Макс. кроків у маршруті", 6, min = 2, max = 10),
-        radioButtons(
-          "top_n_mode",
-          "Рівень деталізації",
-          choices = c(
-            "Основні переходи" = 20,
-            "Баланс" = 100,
-            "Детально" = 200,
-            "Максимально" = 500
-          ),
-          selected = 100
-        ),
+        
         hr()
       ),
       mainPanel(
@@ -3914,7 +3908,7 @@ server <- function(input, output, session) {
     req(audit_data())
     
     datatable(
-      audit_data()$metrics,
+      audit_data()$missing_tbl,
       options = list(dom = "t", scrollX = TRUE),
       rownames = FALSE
     )
