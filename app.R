@@ -13,6 +13,7 @@ library(bslib)
 library(waiter)
 library(later)
 library(shinymanager)
+library(googledrive)
 
 
 options(shiny.maxRequestSize = 500 * 1024^2)
@@ -115,6 +116,9 @@ safe_parse_date <- function(x) {
 }
 
 make_node <- function(df, mode = "brand_category") {
+  mode <- mode %||% "brand_category"
+  mode <- as.character(mode)[1]
+  
   df %>%
     mutate(
       brand = if ("brand" %in% names(.)) coalesce(as.character(brand), "") else "",
@@ -158,41 +162,54 @@ safe_parse_numeric <- function(x) {
   suppressWarnings(as.numeric(x))
 }
 
-prepare_events <- function(df, node_mode = "brand_category", basket_mode = c("main_item", "all_items")) {
-  basket_mode <- match.arg(basket_mode)
+build_base_fact <- function(df, node_mode = "brand_category") {
   sum_col <- detect_sum_column(df)
   
-  df_prepared <- df %>%
+  df %>%
     mutate(
-      client_id = as.character(client_id),
-      transaction_id = as.character(transaction_id),
-      transaction_date = safe_parse_date(transaction_date)
+      row_id_internal = row_number(),
+      client_id = trimws(as.character(client_id)),
+      transaction_id = trimws(as.character(transaction_id)),
+      transaction_date_raw = as.character(transaction_date),
+      transaction_date = safe_parse_date(transaction_date),
+      brand = if ("brand" %in% names(.)) as.character(brand) else NA_character_,
+      product_name = if ("product_name" %in% names(.)) as.character(product_name) else NA_character_,
+      sum_raw = if (!is.null(sum_col)) as.character(.data[[sum_col]]) else NA_character_,
+      item_sum_parsed = if (!is.null(sum_col)) safe_parse_numeric(.data[[sum_col]]) else NA_real_
     ) %>%
+    make_node(node_mode) %>%
+    mutate(
+      brand = as.character(brand),
+      product_name = as.character(product_name)
+    )
+}
+
+prepare_events <- function(base_fact, basket_mode = c("main_item", "all_items")) {
+  basket_mode <- match.arg(basket_mode)
+  
+  df_prepared <- base_fact %>%
     filter(
       !is.na(client_id), trimws(client_id) != "",
       !is.na(transaction_id), trimws(transaction_id) != "",
       !is.na(transaction_date)
-    ) %>%
-    make_node(node_mode) %>%
-    mutate(row_id_internal = row_number())
+    )
   
   if (basket_mode == "main_item") {
-    if (is.null(sum_col)) {
-      stop("Для режиму 'Головний товар' не знайдено колонку з ціною/сумою.")
+    if (!("item_sum_parsed" %in% names(df_prepared))) {
+      stop("У base_fact відсутня колонка item_sum_parsed.")
     }
     
     return(
       df_prepared %>%
-        mutate(item_sum = safe_parse_numeric(.data[[sum_col]])) %>%
         group_by(client_id, transaction_id, transaction_date) %>%
         summarise(
           basket_nodes = list(sort(unique(node))),
           basket_label = {
-            valid <- which(!is.na(item_sum))
+            valid <- which(!is.na(item_sum_parsed))
             if (length(valid) == 0) {
               sort(unique(node))[1]
             } else {
-              idx <- valid[which.max(item_sum[valid])]
+              idx <- valid[which.max(item_sum_parsed[valid])]
               node[idx]
             }
           },
@@ -237,27 +254,79 @@ build_transitions <- function(events, min_days = 0, max_days = 365) {
     )
 }
 
-build_item_transitions <- function(transitions_df, keep_self_transitions = TRUE) {
-  out <- transitions_df %>%
-    rowwise() %>%
-    mutate(
-      pair_tbl = list(
-        expand_grid(
-          from = unlist(basket_nodes),
-          to = unlist(next_nodes)
-        )
-      )
-    ) %>%
+
+
+build_step_paths <- function(events, max_steps = 6) {
+  events %>%
+    group_by(client_id) %>%
+    arrange(transaction_date, transaction_id, .by_group = TRUE) %>%
+    mutate(step = row_number()) %>%
+    filter(step <= max_steps) %>%
     ungroup() %>%
-    select(client_id, lag_days, pair_tbl) %>%
-    unnest(pair_tbl) %>%
-    filter(!is.na(from), !is.na(to))
-  
-  if (!keep_self_transitions) {
-    out <- out %>% filter(from != to)
+    select(client_id, step, basket_label) %>%
+    mutate(step_name = paste0("step_", step)) %>%
+    select(-step) %>%
+    pivot_wider(
+      names_from = step_name,
+      values_from = basket_label
+    )
+}
+
+
+build_item_transitions <- function(transitions_df, keep_self_transitions = TRUE) {
+  if (is.null(transitions_df) || nrow(transitions_df) == 0) {
+    return(tibble::tibble(
+      client_id = character(),
+      lag_days = numeric(),
+      from = character(),
+      to = character()
+    ))
   }
   
-  out
+  pair_list <- purrr::pmap(
+    list(transitions_df$client_id, transitions_df$lag_days, transitions_df$basket_nodes, transitions_df$next_nodes),
+    function(client_id, lag_days, basket_nodes, next_nodes) {
+      from_nodes <- unique(as.character(unlist(basket_nodes)))
+      to_nodes <- unique(as.character(unlist(next_nodes)))
+      
+      from_nodes <- from_nodes[!is.na(from_nodes) & trimws(from_nodes) != ""]
+      to_nodes <- to_nodes[!is.na(to_nodes) & trimws(to_nodes) != ""]
+      
+      if (length(from_nodes) == 0 || length(to_nodes) == 0) {
+        return(NULL)
+      }
+      
+      out <- tidyr::expand_grid(from = from_nodes, to = to_nodes) %>%
+        mutate(
+          client_id = client_id,
+          lag_days = lag_days,
+          .before = 1
+        )
+      
+      if (!keep_self_transitions) {
+        out <- out %>% filter(from != to)
+      }
+      
+      if (nrow(out) == 0) {
+        return(NULL)
+      }
+      
+      out
+    }
+  )
+  
+  pair_list <- purrr::compact(pair_list)
+  
+  if (length(pair_list) == 0) {
+    return(tibble::tibble(
+      client_id = character(),
+      lag_days = numeric(),
+      from = character(),
+      to = character()
+    ))
+  }
+  
+  dplyr::bind_rows(pair_list)
 }
 
 summarise_item_transitions <- function(item_transitions) {
@@ -279,85 +348,14 @@ summarise_item_transitions <- function(item_transitions) {
     arrange(desc(clients), desc(transitions_n))
 }
 
-build_step_paths <- function(events, max_steps = 6) {
-  events %>%
-    group_by(client_id) %>%
-    arrange(transaction_date, transaction_id, .by_group = TRUE) %>%
-    mutate(step = row_number()) %>%
-    filter(step <= max_steps) %>%
-    ungroup() %>%
-    select(client_id, step, basket_label) %>%
-    mutate(step_name = paste0("step_", step)) %>%
-    select(-step) %>%
-    pivot_wider(
-      names_from = step_name,
-      values_from = basket_label
-    )
-}
-
-
-
-make_journey_sankey_data <- function(path_df, max_steps = 6, top_n = 100) {
-  if (nrow(path_df) == 0) {
-    return(list(
-      nodes = data.frame(name = character()),
-      links = data.frame()
-    ))
-  }
-  
-  step_cols <- paste0("step_", 1:max_steps)
-  step_cols <- step_cols[step_cols %in% names(path_df)]
-  
-  all_links <- map_dfr(seq_len(length(step_cols) - 1), function(i) {
-    from_col <- step_cols[i]
-    to_col <- step_cols[i + 1]
-    
-    path_df %>%
-      filter(!is.na(.data[[from_col]]), !is.na(.data[[to_col]])) %>%
-      count(
-        from = .data[[from_col]],
-        to = .data[[to_col]],
-        name = "value",
-        sort = TRUE
-      ) %>%
-      mutate(
-        from_node = paste0(from_col, " | ", from),
-        to_node = paste0(to_col, " | ", to)
-      )
-  })
-  
-  all_links <- all_links %>%
-    arrange(desc(value)) %>%
-    slice_head(n = top_n)
-  
-  nodes <- data.frame(
-    name = unique(c(all_links$from_node, all_links$to_node)),
-    stringsAsFactors = FALSE
-  )
-  
-  links <- all_links %>%
-    mutate(
-      source = match(from_node, nodes$name) - 1,
-      target = match(to_node, nodes$name) - 1
-    ) %>%
-    select(source, target, value)
-  
-  list(nodes = nodes, links = links)
-}
-
-build_replenishment <- function(df, node_mode = "brand_category", min_days = 1, max_days = 365) {
-  df %>%
-    mutate(
-      client_id = as.character(client_id),
-      transaction_id = as.character(transaction_id),
-      transaction_date = safe_parse_date(transaction_date)
-    ) %>%
+build_replenishment <- function(base_fact, min_days = 1, max_days = 365) {
+  base_fact %>%
     filter(
       !is.na(client_id), trimws(client_id) != "",
       !is.na(transaction_id), trimws(transaction_id) != "",
-      !is.na(transaction_date)
+      !is.na(transaction_date),
+      !is.na(node), trimws(node) != ""
     ) %>%
-    make_node(node_mode) %>%
     distinct(client_id, transaction_id, transaction_date, node) %>%
     arrange(client_id, node, transaction_date) %>%
     group_by(client_id, node) %>%
@@ -382,32 +380,107 @@ summarise_replenishment <- function(repl_df) {
     arrange(desc(clients), desc(repeats_n))
 }
 
-build_data_audit <- function(df) {
-  sum_col <- detect_sum_column(df)
-  
-  df2 <- df %>%
-    mutate(
-      client_id = as.character(client_id),
-      transaction_id = as.character(transaction_id),
-      transaction_date_raw = as.character(transaction_date),
-      transaction_date_parsed = safe_parse_date(transaction_date),
-      product_name = if ("product_name" %in% names(.)) as.character(product_name) else NA_character_,
-      brand = if ("brand" %in% names(.)) as.character(brand) else NA_character_
+build_executive_kpis <- function(base_fact, replenishment_df = NULL) {
+  df2 <- base_fact %>%
+    filter(
+      !is.na(client_id), client_id != "",
+      !is.na(transaction_id), transaction_id != ""
     )
   
-  if (!is.null(sum_col)) {
-    df2 <- df2 %>%
-      mutate(
-        sum_raw = as.character(.data[[sum_col]]),
-        sum_parsed = safe_parse_numeric(.data[[sum_col]])
-      )
-  } else {
-    df2 <- df2 %>%
-      mutate(
-        sum_raw = NA_character_,
-        sum_parsed = NA_real_
-      )
+  if (nrow(df2) == 0) {
+    return(list(
+      clients_n = 0,
+      transactions_n = 0,
+      avg_tx_per_client = NA_real_,
+      avg_check = NA_real_,
+      min_purchase_day = NA,
+      max_purchase_day = NA,
+      return_rate = NA_real_,
+      one_time_share = NA_real_,
+      avg_route_length = NA_real_,
+      top_first_step = NA_character_,
+      avg_repurchase_days = NA_real_
+    ))
   }
+  
+  tx_tbl <- df2 %>%
+    distinct(client_id, transaction_id, transaction_date)
+  
+  transactions_n <- n_distinct(tx_tbl$transaction_id)
+  clients_n <- n_distinct(tx_tbl$client_id)
+  
+  client_activity <- tx_tbl %>%
+    count(client_id, name = "transactions_per_client")
+  
+  avg_tx_per_client <- ifelse(clients_n > 0, round(transactions_n / clients_n, 2), NA_real_)
+  
+  one_time_share <- if (nrow(client_activity) > 0) {
+    round(100 * mean(client_activity$transactions_per_client == 1), 1)
+  } else {
+    NA_real_
+  }
+  
+  return_rate <- if (nrow(client_activity) > 0) {
+    round(100 * mean(client_activity$transactions_per_client >= 2), 1)
+  } else {
+    NA_real_
+  }
+  
+  first_steps <- df2 %>%
+    distinct(client_id, transaction_id, transaction_date, node) %>%
+    group_by(client_id) %>%
+    arrange(transaction_date, transaction_id, .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    count(node, sort = TRUE)
+  
+  top_first_step <- if (nrow(first_steps) > 0) first_steps$node[1] else NA_character_
+  
+  valid_dates <- tx_tbl$transaction_date[!is.na(tx_tbl$transaction_date)]
+  min_purchase_day <- if (length(valid_dates) > 0) as.Date(min(valid_dates)) else NA
+  max_purchase_day <- if (length(valid_dates) > 0) as.Date(max(valid_dates)) else NA
+  
+  tx_sum_tbl <- df2 %>%
+    group_by(client_id, transaction_id, transaction_date) %>%
+    summarise(
+      check_sum = sum(item_sum_parsed, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  avg_check <- tx_sum_tbl %>%
+    summarise(val = round(mean(check_sum, na.rm = TRUE), 2)) %>%
+    pull(val)
+  
+  if (length(avg_check) == 0 || is.nan(avg_check)) {
+    avg_check <- NA_real_
+  }
+  
+  avg_repurchase_days <- NA_real_
+  if (!is.null(replenishment_df) && nrow(replenishment_df) > 0) {
+    avg_repurchase_days <- round(mean(replenishment_df$lag_days, na.rm = TRUE), 1)
+    
+    if (length(avg_repurchase_days) == 0 || is.nan(avg_repurchase_days)) {
+      avg_repurchase_days <- NA_real_
+    }
+  }
+  
+  list(
+    clients_n = clients_n,
+    transactions_n = transactions_n,
+    avg_tx_per_client = avg_tx_per_client,
+    avg_check = avg_check,
+    min_purchase_day = min_purchase_day,
+    max_purchase_day = max_purchase_day,
+    return_rate = return_rate,
+    one_time_share = one_time_share,
+    avg_route_length = avg_tx_per_client,
+    top_first_step = top_first_step,
+    avg_repurchase_days = avg_repurchase_days
+  )
+}
+
+build_data_audit <- function(base_fact) {
+  df2 <- base_fact
   
   records_n <- nrow(df2)
   clients_n <- n_distinct(df2$client_id[!is.na(df2$client_id) & trimws(df2$client_id) != ""])
@@ -415,31 +488,32 @@ build_data_audit <- function(df) {
   categories_n <- n_distinct(df2$product_name[!is.na(df2$product_name) & trimws(df2$product_name) != ""])
   brands_n <- n_distinct(df2$brand[!is.na(df2$brand) & trimws(df2$brand) != ""])
   
-  valid_dates <- df2$transaction_date_parsed[!is.na(df2$transaction_date_parsed)]
+  valid_dates <- df2$transaction_date[!is.na(df2$transaction_date)]
   min_date <- if (length(valid_dates) > 0) min(valid_dates) else NA
   max_date <- if (length(valid_dates) > 0) max(valid_dates) else NA
   
   avg_records_per_client <- ifelse(clients_n > 0, round(records_n / clients_n, 2), NA)
   avg_transactions_per_client <- ifelse(clients_n > 0, round(transactions_n / clients_n, 2), NA)
   
-  sum_found_text <- ifelse(is.null(sum_col), "Ні", paste0("Так: ", sum_col))
+  has_sum_col <- any(!is.na(df2$sum_raw))
+  sum_found_text <- ifelse(has_sum_col, "Так", "Ні")
   
-  sum_raw_missing_n <- if (!is.null(sum_col)) {
+  sum_raw_missing_n <- if (has_sum_col) {
     sum(is.na(df2$sum_raw) | trimws(df2$sum_raw) == "")
   } else {
     NA_integer_
   }
   
-  sum_parse_fail_n <- if (!is.null(sum_col)) {
+  sum_parse_fail_n <- if (has_sum_col) {
     sum(
       !(is.na(df2$sum_raw) | trimws(df2$sum_raw) == "") &
-        is.na(df2$sum_parsed)
+        is.na(df2$item_sum_parsed)
     )
   } else {
     NA_integer_
   }
   
-  valid_sum_values <- if (!is.null(sum_col)) df2$sum_parsed[!is.na(df2$sum_parsed)] else numeric(0)
+  valid_sum_values <- if (has_sum_col) df2$item_sum_parsed[!is.na(df2$item_sum_parsed)] else numeric(0)
   sum_min <- if (length(valid_sum_values) > 0) round(min(valid_sum_values), 2) else NA
   sum_max <- if (length(valid_sum_values) > 0) round(max(valid_sum_values), 2) else NA
   sum_mean <- if (length(valid_sum_values) > 0) round(mean(valid_sum_values), 2) else NA
@@ -502,9 +576,9 @@ build_data_audit <- function(df) {
   ) %>%
     mutate(`% пропусків` = round(100 * Пропущено / records_n, 2))
   
-  if (!is.null(sum_col)) {
+  if (has_sum_col) {
     sum_missing_row <- tibble::tibble(
-      Поле = sum_col,
+      Поле = "sum_raw",
       Пропущено = sum(is.na(df2$sum_raw) | trimws(df2$sum_raw) == ""),
       `Унікальних значень` = n_distinct(df2$sum_raw[!is.na(df2$sum_raw) & trimws(df2$sum_raw) != ""]),
       `% пропусків` = round(100 * sum(is.na(df2$sum_raw) | trimws(df2$sum_raw) == "") / records_n, 2)
@@ -544,11 +618,11 @@ build_data_audit <- function(df) {
     filter(!is.na(brand), trimws(brand) != "") %>%
     count(brand, sort = TRUE, name = "Кількість записів")
   
-  sum_parse_examples <- if (!is.null(sum_col)) {
+  sum_parse_examples <- if (has_sum_col) {
     df2 %>%
       filter(
         !(is.na(sum_raw) | trimws(sum_raw) == ""),
-        is.na(sum_parsed)
+        is.na(item_sum_parsed)
       ) %>%
       distinct(Проблемне_значення = sum_raw) %>%
       slice_head(n = 20)
@@ -733,7 +807,8 @@ make_cohort_sankey_data <- function(event_links,
                                     small_branch_threshold = 15,
                                     top_n_large = 10,
                                     min_pct_large = 1,
-                                    min_clients_large = 2) {
+                                    min_clients_large = 2,
+                                    first_level_other_min_branches = 10) {
   
   empty_result <- list(
     nodes = data.frame(
@@ -878,37 +953,65 @@ make_cohort_sankey_data <- function(event_links,
       } else {
         used_reduction <<- TRUE
         
-        # 1. Завжди беремо top N найбільших переходів
         selected_real <- real_targets %>%
           arrange(desc(clients), next_label_raw) %>%
           slice_head(n = top_n_large)
         
-        # 2. Усе інше йде в "Інші переходи"
-        other_real <- real_targets %>%
-          filter(!(next_label_raw %in% selected_real$next_label_raw))
-        
-        other_clients_sum <- sum(other_real$clients, na.rm = TRUE)
         other_details_tbl <- NULL
         other_tbl <- NULL
         
-        # 3. Створюємо "Інші переходи" тільки якщо там справді є що агрегувати
-        if (nrow(other_real) > 0 && other_clients_sum >= min_clients_large) {
-          other_tbl <- tibble::tibble(
-            next_label_raw = "Інші переходи",
-            clients = other_clients_sum
-          )
+        # 🔥 НОВА ЛОГІКА
+        # "Інші переходи" тільки на 1-му рівні і тільки якщо гілок достатньо багато
+        if (lvl == 1 && nrow(real_targets) >= first_level_other_min_branches) {
           
-          other_details_tbl <- other_real %>%
-            mutate(
-              step_from = lvl - 1,
-              step_to = lvl,
-              from = src_label,
-              to_real = next_label_raw,
+          other_real_labels <- real_targets %>%
+            filter(!(next_label_raw %in% selected_real$next_label_raw)) %>%
+            pull(next_label_raw)
+          
+          if (length(other_real_labels) > 0) {
+            
+            # клієнти цих гілок
+            other_clients_raw <- src_df %>%
+              filter(next_label_raw %in% other_real_labels) %>%
+              distinct(client_id, next_step, next_label_raw)
+            
+            # перевірка чи є ще один крок після
+            ev_next_check <- ev %>%
+              transmute(
+                client_id,
+                reached_step = step,
+                has_next_after = ifelse(next_valid, TRUE, FALSE)
+              )
+            
+            other_clients_one_step <- other_clients_raw %>%
+              transmute(
+                client_id,
+                reached_step = next_step,
+                to_real = next_label_raw
+              ) %>%
+              left_join(ev_next_check, by = c("client_id", "reached_step")) %>%
+              filter(is.na(has_next_after) | has_next_after == FALSE)
+            
+            other_clients_sum <- n_distinct(other_clients_one_step$client_id)
+            
+            if (other_clients_sum >= min_clients_large) {
+              other_tbl <- tibble::tibble(
+                next_label_raw = "Інші переходи",
+                clients = other_clients_sum
+              )
               
-              pct_start = round(100 * clients / cohort_size, 1),
-              grouped_into = "Інші переходи"
-            ) %>%
-            select(step_from, step_to, from, to_real, clients, pct_start, grouped_into)
+              other_details_tbl <- other_clients_one_step %>%
+                count(to_real, name = "clients") %>%
+                mutate(
+                  step_from = lvl - 1,
+                  step_to = lvl,
+                  from = src_label,
+                  pct_start = round(100 * clients / cohort_size, 1),
+                  grouped_into = "Інші переходи"
+                ) %>%
+                select(step_from, step_to, from, to_real, clients, pct_start, grouped_into)
+            }
+          }
         }
       }
       
@@ -1206,15 +1309,8 @@ build_cohort_route_clients <- function(journey_long) {
     ungroup()
 }
 
-build_client_profile_tbl <- function(df) {
-  sum_col <- detect_sum_column(df)
-  
-  df2 <- df %>%
-    mutate(
-      client_id = as.character(client_id),
-      transaction_id = as.character(transaction_id),
-      transaction_date = safe_parse_date(transaction_date)
-    ) %>%
+build_client_profile_tbl <- function(base_fact) {
+  df2 <- base_fact %>%
     filter(!is.na(client_id), trimws(client_id) != "")
   
   tx_tbl <- df2 %>%
@@ -1230,13 +1326,14 @@ build_client_profile_tbl <- function(df) {
       .groups = "drop"
     )
   
-  if (!is.null(sum_col)) {
+  has_sum_col <- any(!is.na(df2$sum_raw))
+  
+  if (has_sum_col) {
     money_tbl <- df2 %>%
-      mutate(item_sum = safe_parse_numeric(.data[[sum_col]])) %>%
       group_by(client_id) %>%
       summarise(
-        total_sum = round(sum(item_sum, na.rm = TRUE), 2),
-        avg_item_sum = round(mean(item_sum, na.rm = TRUE), 2),
+        total_sum = round(sum(item_sum_parsed, na.rm = TRUE), 2),
+        avg_item_sum = round(mean(item_sum_parsed, na.rm = TRUE), 2),
         .groups = "drop"
       )
     
@@ -2021,6 +2118,8 @@ ui <- secure_app(
           )
         ),
         
+        
+        
         div(
           class = "info-card",
           style = "margin-top: 10px; padding: 12px 14px;",
@@ -2059,7 +2158,7 @@ ui <- secure_app(
               
               div(style = "flex:1;", uiOutput("kpi_min_purchase_day")),
               div(style = "flex:1;", uiOutput("kpi_max_purchase_day")),
-              div(style = "flex:1;", uiOutput("kpi_route_length")),
+              div(style = "flex:1;", uiOutput("kpi_avg_tx")),
               div(style = "flex:1;", uiOutput("kpi_repurchase"))
             ),
             br(),
@@ -2184,142 +2283,63 @@ ui <- secure_app(
             div(
               id = "cohort_details_block",
               class = "table-card",
-              DTOutput("cohort_sankey_details_tbl")
+              DTOutput("cohort_sankey_details_tbl"),
+              br(),
+              downloadButton("download_cohort_sankey_details", "Завантажити CSV")
             ),
             br(),
+            
             h4("Розшифровка 'Інші переходи'"),
             div(
               class = "table-card",
-              uiOutput("cohort_sankey_other_details_tbl")
+              uiOutput("cohort_sankey_other_details_tbl"),
+              br(),
+              downloadButton("download_cohort_sankey_other_details", "Завантажити CSV")
             ),
             br(),
-            h4("Повні назви вузлів"),
+            
+            
+            hr(),
+            h4("Фільтр клієнтів за послідовністю кроків"),
+            
             div(
               class = "table-card",
-              DTOutput("cohort_sankey_nodes_tbl")),
-            br(),
-            hr(),
-            h4("Клієнти за маршрутом / переходом"),
-            radioButtons(
-              "cohort_clients_mode",
-              "Режим деталізації",
-              choices = c(
-                "Клієнти за переходом" = "transition",
-                "Клієнти за повним маршрутом" = "route"
+              div(
+                class = "section-description",
+                "Оберіть кроки після стартового вузла. Якщо якийсь крок не важливий, залиште “Усі вузли”. Після цього натисніть кнопку для побудови результату. Підготовка результату може тривати кілька хвилин."
               ),
-              selected = "transition",
-              inline = TRUE
-            ),
-            conditionalPanel(
-              condition = "input.cohort_clients_mode == 'transition'",
-              selectizeInput(
-                "cohort_transition_pick",
-                "Оберіть перехід",
-                choices = NULL,
-                options = list(placeholder = "Оберіть перехід зі списку")
+              br(),
+              uiOutput("cohort_dynamic_step_filters"),
+              br(),
+              actionButton(
+                "apply_cohort_client_filters",
+                "Показати клієнтів",
+                class = "btn-primary"
               )
             ),
-            conditionalPanel(
-              condition = "input.cohort_clients_mode == 'route'",
-              selectizeInput(
-                "cohort_route_pick",
-                "Оберіть повний маршрут",
-                choices = NULL,
-                options = list(placeholder = "Оберіть маршрут зі списку")
-              )
-            ),
+            
             br(),
             h4("Ключові показники вибраної групи клієнтів"),
             div(
               class = "table-card",
-              DTOutput("cohort_selected_clients_kpi_tbl")),
+              DTOutput("cohort_selected_clients_kpi_tbl")
+            ),
             br(),
             h4("Список клієнтів"),
             div(
               class = "table-card",
-              DTOutput("cohort_selected_clients_tbl")),
-            br(),
-            downloadButton("download_cohort_selected_clients", "Завантажити CSV")
-          ),
-          tabPanel(
-            "Переходи",
-            br(),
-            make_section_header(
-              "Переходи між покупками",
-              "Аналіз зв'язків між товарами та категоріями."
+              DTOutput("cohort_selected_clients_tbl")
             ),
             br(),
-            selectizeInput(
-              "filter_node",
-              "Фільтр по вузлу",
-              choices = NULL,
-              selected = "",
-              multiple = FALSE,
-              options = list(
-                placeholder = "Усі вузли",
-                maxOptions = 1000,
-                create = FALSE
-              )
-            ),
-            br(),
-            
-            div(
-              class = "table-card",
-              DTOutput("from_tbl")
-            )
-          ),
+            downloadButton("download_cohort_selected_clients", "Завантажити CSV")),
           
-          tabPanel(
-            "Маршрути клієнтів",
-            br(),
-            make_section_header(
-              "Маршрути клієнтів",
-              "Як рухається клієнт між покупками",
-              "Візуалізація повних шляхів клієнтів у вигляді Sankey-діаграми. Допомагає зрозуміти основні сценарії поведінки."
-            ),
-            fluidRow(
-              
-              column(
-                8,
-                selectizeInput("sankey_start_node", "Оберіть вузол", choices = NULL)
-              )
-            ),
-            
-            
-            br(),
-            fluidRow(
-              column(3, numericInput("journey_depth", "Глибина маршруту", 3, min = 1, max = 6)),
-              column(3, numericInput("journey_top_n", "Гілок з кожного вузла", 3, min = 1, max = 8)),
-              column(3, numericInput("journey_min_clients", "Мін. клієнтів у зв'язку", 1, min = 1, max = 100)),
-              column(3, numericInput("journey_label_chars", "Довжина підпису", 22, min = 10, max = 50))
-            ),
-            br(),
-            div(
-              id = "journey_sankey_block",
-              uiOutput("journey_sankey_block")
-            ),
-            div(
-              class = "info-card",
-              p(
-                strong("Що показує цей Sankey: "),
-                "цей графік будує маршрути від обраного вузла і показує, куди клієнти найчастіше переходять далі."
-              ),
-              p(
-                strong("Чим він відрізняється від когортного Sankey: "),
-                "тут можна досліджувати маршрут від конкретного вузла як стартової точки аналізу. У когортному Sankey на наступній вкладці фокус на розвитку вибраної когорти клієнтів у часі."
-              )
-            ),
-            br(),
-            h4("Повні назви вузлів"),
-            div(
-              class = "table-card",
-              DTOutput("journey_nodes_tbl"))
-          ),
+          
+          
           tabPanel("Повернення", 
                    br(),
                    make_section_header(
                      "Повернення клієнтів",
-                     "Як швидко клієнти повертаються",
+                     "Як швидко клієнти повертаються до цієї позиції",
                      "Аналіз повторних покупок та часу між ними. Допомагає зрозуміти регулярність споживання та поведінку клієнтів."
                    ),
                    div(
@@ -2327,12 +2347,12 @@ ui <- secure_app(
                      class = "table-card",
                      DTOutput("replenishment_tbl")
                    ))
-          )
         )
       )
-    ),
-    head_auth = tags$head(
-      tags$style(HTML("
+    )
+  ),
+  head_auth = tags$head(
+    tags$style(HTML("
     body {
       background: #f2ebe3 !important;
       font-family: 'Inter', sans-serif !important;
@@ -2430,43 +2450,75 @@ ui <- secure_app(
       text-align: center !important;
     }
   "))
-    ),
-    
-    # 🔽 Текст і стиль
-    tags_top = div(
-      class = "card-soft",
-      style = "text-align:center;",
-      div(class = "main-title-custom", "Customer Journey Analytics"),
-      div(class = "main-subtitle-custom", "Secure access")
-    ),
-    
-    tags_bottom = div(
-      class = "auth-subtitle",
-      "Secure access"
-    )
-  )
+  ),
   
+  # 🔽 Текст і стиль
+  tags_top = div(
+    class = "card-soft",
+    style = "text-align:center;",
+    div(class = "main-title-custom", "Customer Journey Analytics"),
+    div(class = "main-subtitle-custom", "Secure access")
+  ),
+  
+  tags_bottom = div(
+    class = "auth-subtitle",
+    "Secure access"
+  )
+)
 
+all_nodes_choice <- "__ALL__"
 
+make_step_choices <- function(x) {
+  vals <- sort(unique(as.character(x)))
+  vals <- vals[!is.na(vals) & trimws(vals) != ""]
+  c("Усі вузли" = all_nodes_choice, stats::setNames(vals, vals))
+}
+
+filter_route_tbl_by_steps <- function(tbl, input, depth) {
+  if (is.null(tbl) || nrow(tbl) == 0) return(tbl)
+  
+  for (i in seq_len(depth)) {
+    col_name <- paste0("L", i)
+    input_id <- paste0("cohort_step_pick_", i)
+    
+    if (!(col_name %in% names(tbl))) next
+    
+    selected_val <- input[[input_id]]
+    if (is.null(selected_val) || is.na(selected_val) || selected_val == "" || selected_val == all_nodes_choice) {
+      next
+    }
+    
+    tbl <- tbl %>% filter(.data[[col_name]] == selected_val)
+  }
+  
+  tbl
+}
 
 server <- function(input, output, session) {
   res_auth <- secure_server(
     check_credentials = check_credentials(credentials)
   )
+  
   updating_filters <- reactiveVal(FALSE)
   is_loading <- reactiveVal(FALSE)
   loaded_data <- reactiveVal(NULL)
   cleaned_data_val <- reactiveVal(NULL)
+  base_fact_val <- reactiveVal(NULL)
   is_global_loading <- reactiveVal(FALSE)
-  
+  transitions_summary_val <- reactiveVal(NULL)
   events_data_val <- reactiveVal(NULL)
   event_links_val <- reactiveVal(NULL)
-  transitions_summary_val <- reactiveVal(NULL)
+  applied_cohort_filters <- reactiveVal(NULL)
   audit_data_val <- reactiveVal(NULL)
+  
+  replenishment_summary_val <- reactiveVal(NULL)
+  executive_kpis_val <- reactiveVal(NULL)
   
   output$current_user <- renderText({
     paste("Поточний користувач:", res_auth$user)
   })
+  
+  
   
   raw_data <- reactive({
     req(input$file)
@@ -2480,6 +2532,11 @@ server <- function(input, output, session) {
   cleaned_data <- reactive({
     req(cleaned_data_val())
     cleaned_data_val()
+  })
+  
+  base_fact <- reactive({
+    req(base_fact_val())
+    base_fact_val()
   })
   
   lag_filter_stats <- reactive({
@@ -2625,19 +2682,24 @@ server <- function(input, output, session) {
   rebuild_analysis <- function() {
     req(cleaned_data())
     
+    node_mode_val <- input$node_mode %||% "brand_category"
+    basket_mode_val <- input$basket_mode %||% "main_item"
+    
     df_clean <- cleaned_data()
     
+    # Основний base_fact для поточного режиму користувача
+    base_fact_df <- build_base_fact(df_clean, node_mode = node_mode_val)
+    
     ev <- prepare_events(
-      df_clean,
-      node_mode = input$node_mode,
-      basket_mode = input$basket_mode
+      base_fact_df,
+      basket_mode = basket_mode_val
     )
     
     max_days_val <- if (isTRUE(input$use_max_days)) input$max_days else Inf
     
     lnk <- build_event_links(
       ev,
-      min_days = input$min_days,
+      min_days = input$min_days %||% 1,
       max_days = max_days_val
     )
     
@@ -2661,12 +2723,39 @@ server <- function(input, output, session) {
     )
     
     tr_sum <- summarise_item_transitions(it)
-    aud <- build_data_audit(df_clean)
     
+    aud <- build_data_audit(base_fact_df)
+    
+    # Повернення для таблиці "Повернення" — залежить від поточних фільтрів
+    repl <- build_replenishment(
+      base_fact_df,
+      min_days = max(1, input$min_days %||% 1),
+      max_days = max_days_val
+    )
+    
+    repl_sum <- summarise_replenishment(repl)
+    
+    # ОКРЕМО: стабільний розрахунок для KPI, як у старій версії
+    base_fact_kpi <- build_base_fact(df_clean, node_mode = "brand_category")
+    
+    repl_kpi <- build_replenishment(
+      base_fact_kpi,
+      min_days = 1,
+      max_days = 365
+    )
+    
+    executive_kpis_list <- build_executive_kpis(
+      base_fact = base_fact_kpi,
+      replenishment_df = repl_kpi
+    )
+    
+    base_fact_val(base_fact_df)
     events_data_val(ev)
     event_links_val(lnk)
     transitions_summary_val(tr_sum)
     audit_data_val(aud)
+    replenishment_summary_val(repl_sum)
+    executive_kpis_val(executive_kpis_list)
   }
   
   events_data <- reactive({
@@ -2689,83 +2778,12 @@ server <- function(input, output, session) {
     audit_data_val()
   })
   
-  transitions_raw <- reactive({
-    req(event_links())
-    event_links() %>%
-      filter(next_valid) %>%
-      transmute(
-        client_id,
-        transaction_id,
-        transaction_date,
-        basket_nodes,
-        basket_label,
-        next_basket,
-        next_nodes,
-        next_date,
-        lag_days
-      )
-  })
-  
-  item_transitions <- reactive({
-    req(transitions_raw())
-    build_item_transitions(transitions_raw())
-  })
-  
-  transitions_summary <- reactive({
-    req(transitions_summary_val())
-    transitions_summary_val()
-  })
-  
-  audit_data <- reactive({
-    req(audit_data_val())
-    audit_data_val()
-  })
-  
-  filtered_transition_choices <- reactive({
-    req(transitions_summary())
-    
-    all_nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
-    all_nodes
-  })
-  
-  observe({
-    choices <- filtered_transition_choices()
-    current_selected <- isolate(input$filter_node)
-    
-    selected_value <- if (!is.null(current_selected) &&
-                          length(current_selected) > 0 &&
-                          current_selected %in% choices) {
-      current_selected
-    } else {
-      ""
-    }
-    
-    freezeReactiveValue(input, "filter_node")
-    updateSelectizeInput(
-      session,
-      "filter_node",
-      choices = c("Усі" = "", choices),
-      selected = selected_value,
-      server = TRUE
-    )
-  })
   
   
-  replenishment_data <- reactive({
-    build_replenishment(
-      cleaned_data(),
-      node_mode = input$node_mode,
-      min_days = max(1, input$min_days),
-      max_days = input$max_days
-    )
-  })
   
   replenishment_summary <- reactive({
-    summarise_replenishment(replenishment_data())
-  })
-  
-  audit_data <- reactive({
-    build_data_audit(cleaned_data())
+    req(replenishment_summary_val())
+    replenishment_summary_val()
   })
   
   cohort_data <- reactive({
@@ -2778,21 +2796,6 @@ server <- function(input, output, session) {
   
   
   
-  filtered_sankey_choices <- reactive({
-    req(transitions_summary())
-    
-    all_nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
-    
-    search_txt <- input$sankey_search
-    if (is.null(search_txt)) search_txt <- ""
-    search_txt <- trimws(tolower(search_txt))
-    
-    if (search_txt == "") {
-      return(all_nodes)
-    }
-    
-    all_nodes[stringr::str_detect(tolower(all_nodes), fixed(search_txt))]
-  })
   
   filtered_cohort_sankey_choices <- reactive({
     req(transitions_summary())
@@ -2856,7 +2859,7 @@ server <- function(input, output, session) {
   })
   
   client_profile_tbl <- reactive({
-    build_client_profile_tbl(cleaned_data())
+    build_client_profile_tbl(base_fact())
   })
   
   cohort_journey_long <- reactive({
@@ -2883,27 +2886,100 @@ server <- function(input, output, session) {
     build_cohort_route_clients(jl)
   })
   
+  cohort_route_clients_for_filter <- reactive({
+    tbl <- cohort_route_clients_all()
+    req(nrow(tbl) > 0)
+    
+    tbl %>%
+      mutate(
+        L0 = if ("L0" %in% names(.)) as.character(L0) else NA_character_,
+        L1 = if ("L1" %in% names(.)) as.character(L1) else NA_character_,
+        L2 = if ("L2" %in% names(.)) as.character(L2) else NA_character_,
+        L3 = if ("L3" %in% names(.)) as.character(L3) else NA_character_,
+        L4 = if ("L4" %in% names(.)) as.character(L4) else NA_character_,
+        L5 = if ("L5" %in% names(.)) as.character(L5) else NA_character_,
+        L6 = if ("L6" %in% names(.)) as.character(L6) else NA_character_
+      )
+  })
   
   
+  observeEvent(
+    {
+      list(
+        input$cohort_depth,
+        input$cohort_sankey_start_node,
+        cohort_route_clients_for_filter()
+      )
+    },
+    {
+      req(!isTRUE(updating_filters()))
+      
+      tbl <- cohort_route_clients_for_filter()
+      req(nrow(tbl) > 0)
+      req(input$cohort_depth)
+      
+      updating_filters(TRUE)
+      on.exit(updating_filters(FALSE), add = TRUE)
+      
+      n_filters <- input$cohort_depth
+      current_tbl <- tbl
+      
+      for (i in seq_len(n_filters)) {
+        col_name <- paste0("L", i)
+        input_id <- paste0("cohort_step_pick_", i)
+        
+        if (!(col_name %in% names(current_tbl))) {
+          freezeReactiveValue(input, input_id)
+          updateSelectizeInput(
+            session,
+            inputId = input_id,
+            choices = c("Усі вузли" = all_nodes_choice),
+            selected = all_nodes_choice,
+            server = TRUE
+          )
+          next
+        }
+        
+        valid_choices <- make_step_choices(current_tbl[[col_name]])
+        current_selected <- isolate(input[[input_id]]) %||% all_nodes_choice
+        
+        if (!(current_selected %in% unname(valid_choices))) {
+          current_selected <- all_nodes_choice
+        }
+        
+        freezeReactiveValue(input, input_id)
+        updateSelectizeInput(
+          session,
+          inputId = input_id,
+          choices = valid_choices,
+          selected = current_selected,
+          server = TRUE
+        )
+        
+        if (!is.null(current_selected) &&
+            !is.na(current_selected) &&
+            current_selected != "" &&
+            current_selected != all_nodes_choice) {
+          current_tbl <- current_tbl %>%
+            filter(.data[[col_name]] == current_selected)
+        }
+      }
+    },
+    ignoreInit = FALSE
+  )
   
   
   executive_tx_tbl <- reactive({
-    df <- cleaned_data()
-    sum_col <- detect_sum_column(df)
-    
-    df2 <- df %>%
-      mutate(
-        client_id = as.character(client_id),
-        transaction_id = as.character(transaction_id),
-        transaction_date = safe_parse_date(transaction_date)
-      ) %>%
+    df2 <- base_fact() %>%
       filter(
         !is.na(client_id), trimws(client_id) != "",
         !is.na(transaction_id), trimws(transaction_id) != "",
         !is.na(transaction_date)
       )
     
-    if (is.null(sum_col)) {
+    has_sum_col <- any(!is.na(df2$sum_raw))
+    
+    if (!has_sum_col) {
       return(
         df2 %>%
           distinct(client_id, transaction_id, transaction_date) %>%
@@ -2912,98 +2988,49 @@ server <- function(input, output, session) {
     }
     
     df2 %>%
-      mutate(item_sum = safe_parse_numeric(.data[[sum_col]])) %>%
       group_by(client_id, transaction_id, transaction_date) %>%
       summarise(
-        check_sum = sum(item_sum, na.rm = TRUE),
+        check_sum = sum(item_sum_parsed, na.rm = TRUE),
         .groups = "drop"
       )
   })
   
   executive_kpis <- reactive({
+    req(executive_kpis_val())
+    executive_kpis_val()
+  })
+  
+  output$cohort_dynamic_step_filters <- renderUI({
+    req(input$cohort_depth)
     
-    df <- cleaned_data()
+    n_filters <- input$cohort_depth
     
-    df2 <- df %>%
-      mutate(
-        client_id = trimws(as.character(client_id)),
-        transaction_id = trimws(as.character(transaction_id)),
-        transaction_date = safe_parse_date(transaction_date)
-      ) %>%
-      filter(
-        !is.na(client_id), client_id != "",
-        !is.na(transaction_id), transaction_id != ""
-      )
+    if (is.null(n_filters) || n_filters <= 0) return(NULL)
     
-    # транзакції
-    transactions_n <- df2 %>%
-      distinct(client_id, transaction_id) %>%
-      nrow()
+    rows <- split(seq_len(n_filters), ceiling(seq_len(n_filters) / 4))
     
-    # клієнти
-    clients_n <- df2 %>%
-      distinct(client_id) %>%
-      nrow()
-    
-    # транзакції на клієнта
-    client_activity <- df2 %>%
-      distinct(client_id, transaction_id) %>%
-      count(client_id, name = "transactions_per_client")
-    
-    avg_tx_per_client <- round(mean(client_activity$transactions_per_client), 2)
-    
-    # одноразові
-    one_time_share <- round(
-      100 * mean(client_activity$transactions_per_client == 1),
-      1
-    )
-    
-    # частка клієнтів з 2+ транзакціями
-    return_rate <- round(
-      100 * mean(client_activity$transactions_per_client >= 2),
-      1
-    )
-    
-    # середня довжина маршруту
-    avg_route_length <- avg_tx_per_client
-    
-    # перший крок
-    first_steps <- df2 %>%
-      make_node("brand_category") %>%
-      group_by(client_id) %>%
-      arrange(transaction_date, transaction_id, .by_group = TRUE) %>%
-      slice(1) %>%
-      ungroup() %>%
-      count(node, sort = TRUE)
-    
-    top_first_step <- ifelse(nrow(first_steps) > 0, first_steps$node[1], NA)
-    
-    # повторні покупки
-    repl_df <- build_replenishment(df2)
-    
-    avg_repurchase_days <- ifelse(
-      nrow(repl_df) > 0,
-      round(mean(repl_df$lag_days, na.rm = TRUE), 1),
-      NA
-    )
-    valid_dates <- df2$transaction_date[!is.na(df2$transaction_date)]
-    
-    min_date <- if (length(valid_dates) > 0) min(valid_dates) else NA
-    min_purchase_day <- if (all(is.na(min_date))) NA else as.Date(min_date)
-    
-    max_date <- if (length(valid_dates) > 0) max(valid_dates) else NA
-    max_purchase_day <- if (all(is.na(max_date))) NA else as.Date(max_date)
-    list(
-      clients_n = clients_n,
-      transactions_n = transactions_n,
-      avg_tx_per_client = avg_tx_per_client,
-      min_purchase_day = min_purchase_day,
-      max_purchase_day = max_purchase_day,
-      return_rate = return_rate,
-      one_time_share = one_time_share,
-      avg_route_length = avg_route_length,
-      top_first_step = top_first_step,
-      avg_repurchase_days = avg_repurchase_days
+    tagList(
+      lapply(rows, function(idx_group) {
+        fluidRow(
+          lapply(idx_group, function(i) {
+            column(
+              width = 3,
+              selectizeInput(
+                inputId = paste0("cohort_step_pick_", i),
+                label = paste("Крок", i + 1),
+                choices = c("Усі вузли" = all_nodes_choice),
+                selected = all_nodes_choice,
+                multiple = FALSE,
+                options = list(
+                  placeholder = "Усі вузли",
+                  create = FALSE,
+                  maxOptions = 1000
+                )
+              )
+            )
+          })
+        )
+      })
     )
   })
   
@@ -3062,7 +3089,7 @@ server <- function(input, output, session) {
     make_kpi_card(
       title = "Середня кількість транзакцій на клієнта",
       value = k$avg_tx_per_client,
-      subtitle = "Глибина взаємодії",
+      subtitle = "Частота покупок",
       color = "#78aee0"
     )
   })
@@ -3182,116 +3209,149 @@ server <- function(input, output, session) {
     )
   })
   
-  
-  
-  
-  
-  observe({
+  observeEvent(cohort_transition_clients_all(), {
     tbl <- cohort_transition_clients_all()
+    current_selected <- isolate(input$cohort_transition_pick)
     
     if (nrow(tbl) == 0) {
-      updateSelectizeInput(session, "cohort_transition_pick", choices = character(0), selected = character(0), server = TRUE)
-    } else {
-      choices_tbl <- tbl %>%
-        distinct(step_from, step_to, from, to) %>%
-        arrange(step_to, from, desc(to)) %>%
-        mutate(
-          choice_label = paste0("[", step_from, " → ", step_to, "] ", from, " → ", to),
-          choice_value = paste(step_from, step_to, from, to, sep = "|||")
-        )
-      
+      freezeReactiveValue(input, "cohort_transition_pick")
       updateSelectizeInput(
         session,
         "cohort_transition_pick",
-        choices = stats::setNames(choices_tbl$choice_value, choices_tbl$choice_label),
-        selected = if (nrow(choices_tbl) > 0) choices_tbl$choice_value[1] else character(0),
+        choices = character(0),
+        selected = character(0),
         server = TRUE
       )
+      return()
     }
-  })
+    
+    choices_tbl <- tbl %>%
+      distinct(step_from, step_to, from, to) %>%
+      arrange(step_to, from, desc(to)) %>%
+      mutate(
+        choice_label = paste0("[", step_from, " → ", step_to, "] ", from, " → ", to),
+        choice_value = paste(step_from, step_to, from, to, sep = "|||")
+      )
+    
+    available_values <- choices_tbl$choice_value
+    
+    selected_value <- if (!is.null(current_selected) &&
+                          length(current_selected) > 0 &&
+                          current_selected %in% available_values) {
+      current_selected
+    } else {
+      character(0)
+    }
+    
+    freezeReactiveValue(input, "cohort_transition_pick")
+    updateSelectizeInput(
+      session,
+      "cohort_transition_pick",
+      choices = stats::setNames(choices_tbl$choice_value, choices_tbl$choice_label),
+      selected = selected_value,
+      server = TRUE
+    )
+  }, ignoreInit = FALSE)
   
-  observe({
+  
+  observeEvent(cohort_route_clients_all(), {
     tbl <- cohort_route_clients_all()
+    current_selected <- isolate(input$cohort_route_pick)
     
     if (nrow(tbl) == 0) {
-      updateSelectizeInput(session, "cohort_route_pick", choices = character(0), selected = character(0), server = TRUE)
-    } else {
-      route_choices <- tbl %>%
-        distinct(route, route_depth) %>%
-        filter(!is.na(route), trimws(route) != "") %>%
-        count(route, route_depth, name = "clients") %>%
-        arrange(desc(clients), desc(route_depth), route) %>%
-        mutate(
-          choice_label = paste0(route, "  (", clients, " клієнтів)"),
-          choice_value = route
-        )
-      
+      freezeReactiveValue(input, "cohort_route_pick")
       updateSelectizeInput(
         session,
         "cohort_route_pick",
-        choices = stats::setNames(route_choices$choice_value, route_choices$choice_label),
-        selected = if (nrow(route_choices) > 0) route_choices$choice_value[1] else character(0),
+        choices = character(0),
+        selected = character(0),
         server = TRUE
       )
+      return()
     }
-  })
-  
-  cohort_selected_clients_tbl <- reactive({
-    profiles <- client_profile_tbl()
     
-    mode <- input$cohort_clients_mode %||% "transition"
-    
-    if (mode == "transition") {
-      req(input$cohort_transition_pick)
-      
-      parts <- strsplit(input$cohort_transition_pick, "\\|\\|\\|")[[1]]
-      req(length(parts) == 4)
-      
-      step_from_val <- as.integer(parts[1])
-      step_to_val <- as.integer(parts[2])
-      from_val <- parts[3]
-      to_val <- parts[4]
-      
-      cohort_transition_clients_all() %>%
-        filter(
-          step_from == step_from_val,
-          step_to == step_to_val,
-          from == from_val,
-          to == to_val
-        ) %>%
-        distinct(client_id) %>%
-        left_join(profiles, by = "client_id") %>%
-        arrange(desc(last_tx_date), desc(transactions_n), client_id)
-      
-    } else {
-      req(input$cohort_route_pick)
-      
-      cohort_route_clients_all() %>%
-        filter(route == input$cohort_route_pick) %>%
-        distinct(client_id, route, route_depth) %>%
-        left_join(profiles, by = "client_id") %>%
-        arrange(desc(last_tx_date), desc(transactions_n), client_id)
-    }
-  })
-  
-  output$cohort_selected_clients_kpi_tbl <- renderDT({
-    tbl <- cohort_selected_clients_tbl()
-    
-    kpi_tbl <- build_selected_clients_kpi(tbl) %>%
-      rename(
-        `Показник` = Показник,
-        `Значення` = Значення
+    route_choices <- tbl %>%
+      distinct(route, route_depth) %>%
+      filter(!is.na(route), trimws(route) != "") %>%
+      count(route, route_depth, name = "clients") %>%
+      arrange(desc(clients), desc(route_depth), route) %>%
+      mutate(
+        choice_label = paste0(route, "  (", clients, " клієнтів)"),
+        choice_value = route
       )
     
-    datatable(
-      kpi_tbl,
-      options = list(dom = "t", scrollX = TRUE),
-      rownames = FALSE
+    available_values <- route_choices$choice_value
+    
+    selected_value <- if (!is.null(current_selected) &&
+                          length(current_selected) > 0 &&
+                          current_selected %in% available_values) {
+      current_selected
+    } else {
+      character(0)
+    }
+    
+    freezeReactiveValue(input, "cohort_route_pick")
+    updateSelectizeInput(
+      session,
+      "cohort_route_pick",
+      choices = stats::setNames(route_choices$choice_value, route_choices$choice_label),
+      selected = selected_value,
+      server = TRUE
     )
+  }, ignoreInit = FALSE)
+  
+  observeEvent(input$apply_cohort_client_filters, {
+    req(input$cohort_depth)
+    
+    selected_steps <- lapply(seq_len(input$cohort_depth), function(i) {
+      input[[paste0("cohort_step_pick_", i)]]
+    })
+    names(selected_steps) <- paste0("L", seq_len(input$cohort_depth))
+    
+    applied_cohort_filters(list(
+      depth = input$cohort_depth,
+      steps = selected_steps
+    ))
+  }, ignoreInit = TRUE)
+  
+  cohort_selected_clients_tbl <- reactive({
+    filters <- applied_cohort_filters()
+    req(filters)
+    
+    profiles <- client_profile_tbl()
+    tbl <- cohort_route_clients_for_filter()
+    
+    if (nrow(tbl) == 0) {
+      return(tibble::tibble())
+    }
+    
+    for (col_name in names(filters$steps)) {
+      selected_val <- filters$steps[[col_name]]
+      
+      if (!is.null(selected_val) &&
+          !is.na(selected_val) &&
+          selected_val != "" &&
+          selected_val != all_nodes_choice &&
+          col_name %in% names(tbl)) {
+        tbl <- tbl %>% filter(.data[[col_name]] == selected_val)
+      }
+    }
+    
+    tbl %>%
+      select(client_id, route, route_depth, starts_with("L")) %>%
+      distinct() %>%
+      left_join(profiles, by = "client_id") %>%
+      arrange(desc(last_tx_date), desc(transactions_n), client_id)
   })
   
   output$cohort_selected_clients_tbl <- renderDT({
+    req(applied_cohort_filters())
+    
     tbl <- cohort_selected_clients_tbl()
+    
+    validate(
+      need(nrow(tbl) > 0, "За обраними кроками клієнтів не знайдено.")
+    )
     
     if ("first_tx_date" %in% names(tbl)) {
       tbl <- tbl %>%
@@ -3303,7 +3363,6 @@ server <- function(input, output, session) {
         mutate(last_tx_date = as.Date(last_tx_date))
     }
     
-    # 🔥 ПРИБИРАЄМО НЕПОТРІБНІ КОЛОНКИ
     tbl <- tbl %>%
       select(-any_of(c("total_sum", "avg_item_sum")))
     
@@ -3311,34 +3370,154 @@ server <- function(input, output, session) {
       client_id = "Клієнт",
       route = "Маршрут",
       route_depth = "Глибина маршруту",
+      L0 = "Крок 1",
+      L1 = "Крок 2",
+      L2 = "Крок 3",
+      L3 = "Крок 4",
+      L4 = "Крок 5",
+      L5 = "Крок 6",
+      L6 = "Крок 7",
       transactions_n = "Кількість транзакцій",
       first_tx_date = "Дата першої покупки",
       last_tx_date = "Дата останньої покупки"
     )
     
     existing_map <- rename_map[names(rename_map) %in% names(tbl)]
+    
     if (length(existing_map) > 0) {
-      tbl <- tbl %>% rename(!!!setNames(names(existing_map), existing_map))
+      tbl <- tbl %>%
+        rename(!!!setNames(names(existing_map), existing_map))
     }
     
     datatable(
       tbl,
-      options = list(pageLength = 20, scrollX = TRUE),
+      options = list(
+        pageLength = 20,
+        scrollX = TRUE
+      ),
+      rownames = FALSE,
+      filter = "top",
+      caption = htmltools::tags$caption(
+        style = "caption-side: bottom; text-align: left; color: #6b7280; font-size: 13px; padding-top: 8px;",
+        htmltools::HTML(
+          "<b>Примітка:</b> дата першої та останньої покупки відображає загальну історію клієнта, а не лише покупки в межах вибраного маршруту або категорій."
+        )
+      )
+    )
+  })
+  
+  output$cohort_selected_clients_kpi_tbl <- renderDT({
+    req(applied_cohort_filters())
+    
+    tbl <- cohort_selected_clients_tbl()
+    
+    validate(
+      need(nrow(tbl) > 0, "За обраними кроками клієнтів не знайдено.")
+    )
+    
+    kpi_tbl <- build_selected_clients_kpi(tbl) %>%
+      rename(
+        `Показник` = Показник,
+        `Значення` = Значення
+      )
+    
+    datatable(
+      kpi_tbl,
+      options = list(
+        dom = "t",
+        scrollX = TRUE
+      ),
       rownames = FALSE
     )
   })
   
   output$download_cohort_selected_clients <- downloadHandler(
     filename = function() {
-      paste0("cohort_clients_", Sys.Date(), ".csv")
+      node <- input$cohort_sankey_start_node
+      
+      if (is.null(node) || is.na(node) || trimws(node) == "") {
+        node <- "start_node"
+      }
+      
+      node_clean <- node %>%
+        stringr::str_replace_all("[\\\\/:*?\"<>|]+", "_") %>%   # небезпечні символи
+        stringr::str_replace_all("\\s+", "_") %>%               # пробіли -> _
+        stringr::str_replace_all("_+", "_") %>%                 # кілька _ підряд -> один
+        stringr::str_replace_all("^_|_$", "")                   # прибрати _ на початку/в кінці
+      
+      node_clean <- substr(node_clean, 1, 60)
+      
+      paste0("clients_", node_clean, "_", Sys.Date(), ".csv")
     },
     content = function(file) {
-      df <- cohort_selected_clients_tbl() %>%
-        dplyr::select(-dplyr::any_of(c("total_sum", "avg_item_sum")))
+      req(input$apply_cohort_client_filters > 0)
       
-      readr::write_excel_csv(df, file)
+      export_tbl <- cohort_selected_clients_tbl() %>%
+        dplyr::select(-any_of(c("total_sum", "avg_item_sum", "route", "transactions_n", "route_depth", "first_tx_date", "last_tx_date")))
+      
+      readr::write_excel_csv2(export_tbl, file)
     }
   )
+  
+  output$download_cohort_sankey_details <- downloadHandler(
+    filename = function() {
+      node <- input$cohort_sankey_start_node
+      
+      if (is.null(node) || node == "") {
+        node <- "all"
+      }
+      
+      node_clean <- node %>%
+        stringr::str_replace_all("[^[:alnum:]]+", "_") %>%
+        stringr::str_to_lower()
+      
+      paste0("other_", node_clean, "_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      sk <- cohort_sankey_data()
+      req(!is.null(sk), nrow(sk$details) > 0)
+      
+      tbl <- sk$details %>%
+        transmute(
+          `Стартовий рівень` = step_from,
+          `Рівень переходу` = step_to,
+          `Від вузла` = from,
+          `До вузла` = to,
+          `Клієнтів` = clients,
+          `Частка від старту, %` = pct_start
+        )
+      
+      readr::write_excel_csv2(tbl, file)
+    }
+  )
+  
+  
+  
+  output$download_cohort_sankey_other_details <- downloadHandler(
+    filename = function() {
+      node <- input$cohort_sankey_start_node
+      
+      if (is.null(node) || node == "") {
+        node <- "all"
+      }
+      
+      node_clean <- node %>%
+        stringr::str_replace_all("[^[:alnum:]]+", "_") %>%
+        stringr::str_to_lower()
+      
+      paste0("details_", node_clean, "_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      sk <- cohort_sankey_data()
+      req(!is.null(sk), !is.null(sk$other_details), nrow(sk$other_details) > 0)
+      
+      tbl <- sk$other_details
+      
+      readr::write_excel_csv2(tbl, file)
+    }
+  )
+  
+  
   
   output$cohort_sankey_kpi_tbl <- renderDT({
     sk <- cohort_sankey_data()
@@ -3426,18 +3605,7 @@ server <- function(input, output, session) {
     )
   })
   
-  journey_sankey_data <- reactive({
-    req(input$sankey_start_node)
-    
-    make_recursive_focused_sankey_data(
-      transitions_summary = transitions_summary(),
-      start_node = input$sankey_start_node,
-      depth = input$journey_depth,
-      top_n_per_node = input$journey_top_n,
-      min_clients_link = input$journey_min_clients,
-      max_label_chars = input$journey_label_chars
-    )
-  })
+  
   
   # ----------------------------
   # STABLE FILTER LOGIC
@@ -3445,107 +3613,9 @@ server <- function(input, output, session) {
   
   
   
-  filtered_transition_choices <- reactive({
-    req(transitions_summary())
-    
-    all_nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
-    
-    search_txt <- input$transition_search
-    if (is.null(search_txt)) search_txt <- ""
-    search_txt <- trimws(tolower(search_txt))
-    
-    if (search_txt == "") {
-      return(all_nodes)
-    }
-    
-    all_nodes[stringr::str_detect(tolower(all_nodes), fixed(search_txt))]
-  })
-  
-  observe({
-    choices <- filtered_transition_choices()
-    current_selected <- isolate(input$filter_node)
-    
-    selected_value <- if (!is.null(current_selected) &&
-                          length(current_selected) > 0 &&
-                          current_selected %in% choices) {
-      current_selected
-    } else {
-      ""
-    }
-    
-    freezeReactiveValue(input, "filter_node")
-    updateSelectizeInput(
-      session,
-      "filter_node",
-      choices = c("Усі" = "", choices),
-      selected = selected_value,
-      server = TRUE
-    )
-  })
   
   
   
-  
-  observe({
-    choices <- filtered_sankey_choices()
-    current_selected <- isolate(input$sankey_start_node)
-    
-    selected_value <- if (!is.null(current_selected) &&
-                          length(current_selected) > 0 &&
-                          current_selected %in% choices) {
-      current_selected
-    } else if (length(choices) > 0) {
-      choices[1]
-    } else {
-      character(0)
-    }
-    
-    freezeReactiveValue(input, "sankey_start_node")
-    updateSelectizeInput(
-      session,
-      "sankey_start_node",
-      choices = choices,
-      selected = selected_value,
-      server = TRUE
-    )
-  })
-  
-  output$from_tbl <- renderDT({
-    req(transitions_summary())
-    
-    tbl <- transitions_summary()
-    
-    validate(
-      need(nrow(tbl) > 0, "Немає переходів для побудови таблиці. Перевірте дані або лаги.")
-    )
-    
-    if (!is.null(input$filter_node) && input$filter_node != "") {
-      tbl <- tbl %>% filter(from == input$filter_node)
-    }
-    
-    validate(
-      need(nrow(tbl) > 0, "За поточним фільтром переходів нічого не знайдено.")
-    )
-    
-    tbl <- tbl %>%
-      rename(
-        `Звідки` = from,
-        `Куди` = to,
-        `Клієнтів` = clients,
-        `Кількість переходів` = transitions_n,
-        `Сер. лаг, днів` = avg_lag_days,
-        `Медіанний лаг, днів` = median_lag_days,
-        `Клієнтів у стартовому вузлі` = from_clients,
-        `Конверсія, %` = conversion_from_clients
-      ) %>%
-      arrange(desc(`Клієнтів`), desc(`Кількість переходів`))
-    
-    datatable(
-      tbl,
-      options = list(scrollX = TRUE, pageLength = 15),
-      rownames = FALSE
-    )
-  })
   
   output$replenishment_tbl <- renderDT({
     
@@ -3570,34 +3640,7 @@ server <- function(input, output, session) {
     )
   })
   
-  output$journey_sankey_plot <- renderSankeyNetwork({
-    sk <- journey_sankey_data()
-    
-    validate(
-      need(!is.null(sk), ""),
-      need(nrow(sk$nodes) > 0, ""),
-      need(nrow(sk$links) > 0, "")
-    )
-    
-    colour_scale <- 'd3.scaleOrdinal()
-    .domain(["level_0", "level_1", "level_2", "level_3", "level_4", "level_5", "level_6"])
-    .range(["#2563EB", "#60A5FA", "#F59E0B", "#34D399", "#F472B6", "#A78BFA", "#9CA3AF"])'
-    
-    sankeyNetwork(
-      Links = sk$links,
-      Nodes = sk$nodes,
-      Source = "source",
-      Target = "target",
-      Value = "value",
-      NodeID = "name",
-      NodeGroup = "level",
-      fontSize = 12,
-      nodeWidth = 30,
-      nodePadding = 22,
-      
-      colourScale = colour_scale
-    )
-  })
+  
   
   output$cohort_sankey_plot <- renderSankeyNetwork({
     sk <- cohort_sankey_data()
@@ -3630,68 +3673,6 @@ server <- function(input, output, session) {
   
   
   
-  output$journey_sankey_block <- renderUI({
-    show_block_loader("journey_sankey_block", "Будуємо маршрут клієнтів...")
-    on.exit(hide_block_loader("journey_sankey_block"), add = TRUE)
-    
-    sk <- journey_sankey_data()
-    
-    if (is.null(sk) || nrow(sk$nodes) == 0 || nrow(sk$links) == 0) {
-      return(
-        div(
-          class = "info-card",
-          style = "min-height: 220px; display:flex; align-items:center;",
-          div(
-            style = "width:100%;",
-            h4("Маршрути для обраного вузла не знайдено"),
-            p("За поточними параметрами для цього вузла немає достатньо переходів для побудови Sankey-діаграми."),
-            tags$ul(
-              tags$li("оберіть інший вузол"),
-              tags$li("зменште мінімальну кількість клієнтів у зв'язку"),
-              tags$li("збільшіть глибину маршруту або кількість гілок"),
-              tags$li("перевірте фільтри та логіку кошика")
-            )
-          )
-        )
-      )
-    }
-    
-    sankeyNetworkOutput("journey_sankey_plot", height = "850px")
-  })
-  
-  output$cohort_sankey_nodes_tbl <- renderDT({
-    sk <- cohort_sankey_data()
-    
-    validate(
-      need(!is.null(sk), "Немає даних для відображення."),
-      need(nrow(sk$nodes) > 0, "Для обраного стартового вузла список вузлів недоступний.")
-    )
-    
-    tbl <- sk$nodes %>%
-      select(level, name, full_name) %>%
-      mutate(
-        level = case_when(
-          level == "level_0" ~ "Стартовий крок",
-          level == "level_1" ~ "2-й крок",
-          level == "level_2" ~ "3-й крок",
-          level == "level_3" ~ "4-й крок",
-          level == "level_4" ~ "5-й крок",
-          level == "level_5" ~ "6-й крок",
-          TRUE ~ level
-        )
-      ) %>%
-      rename(
-        `Рівень маршруту` = level,
-        `Коротка назва` = name,
-        `Повна назва вузла` = full_name
-      )
-    
-    datatable(
-      tbl,
-      options = list(scrollX = TRUE, pageLength = 10),
-      rownames = FALSE
-    )
-  })
   
   
   output$cohort_kpi_tbl <- renderDT({
@@ -3882,7 +3863,7 @@ server <- function(input, output, session) {
     )
   })
   
-
+  
   
   output$audit_metrics_tbl <- renderDT({
     show_block_loader("audit_metrics_tbl_block", "Готуємо метрики аудиту...")
@@ -4025,21 +4006,34 @@ server <- function(input, output, session) {
     )
   })
   
+  observeEvent(
+    list(
+      input$node_mode,
+      input$basket_mode,
+      input$min_days,
+      input$use_max_days,
+      input$max_days
+    ),
+    {
+      rebuild_analysis()
+    }
+  )
   
   
   
   observeEvent(input$file, {
     req(input$file)
     
-    file_path <- input$file$datapath
-    show_global_loader("Завантажуємо файл і готуємо результати...")
+    show_global_loader("Завантажуємо та обробляємо файл...")
     
     tryCatch({
+      file_path <- input$file$datapath
+      
       df_raw <- read_input_data(file_path)
       
-      if (nrow(df_raw) == 0) {
-        stop("Файл порожній")
-      }
+      validate(
+        need(nrow(df_raw) > 0, "Файл порожній")
+      )
       
       df_clean <- prepare_cleaned_data(df_raw)
       
@@ -4050,7 +4044,6 @@ server <- function(input, output, session) {
       
       session$onFlushed(function() {
         hide_global_loader()
-        showNotification("Файл успішно завантажено. Результати оновлено.", type = "message", duration = 4)
       }, once = TRUE)
       
     }, error = function(e) {
@@ -4060,74 +4053,17 @@ server <- function(input, output, session) {
       event_links_val(NULL)
       transitions_summary_val(NULL)
       audit_data_val(NULL)
+      replenishment_summary_val(NULL)
       
       hide_global_loader()
+      
       showNotification(
         paste("Помилка завантаження:", conditionMessage(e)),
         type = "error",
-        duration = 8
+        duration = NULL
       )
     })
-  })
-  
-  observeEvent(
-    list(
-      input$node_mode,
-      input$basket_mode,
-      input$min_days,
-      input$use_max_days,
-      input$max_days
-    ),
-    {
-      req(cleaned_data())
-      
-      show_global_loader("Оновлюємо розрахунки...")
-      
-      tryCatch({
-        rebuild_analysis()
-        session$onFlushed(function() {
-          hide_global_loader()
-        }, once = TRUE)
-      }, error = function(e) {
-        hide_global_loader()
-        showNotification(
-          paste("Помилка оновлення:", conditionMessage(e)),
-          type = "error",
-          duration = 8
-        )
-      })
-    },
-    ignoreInit = TRUE
-  )
-  
-  observeEvent(
-    list(
-      input$node_mode,
-      input$basket_mode,
-      input$min_days,
-      input$max_days,
-      input$journey_depth,
-      input$journey_top_n,
-      input$journey_min_clients,
-      input$journey_label_chars,
-      input$cohort_depth,
-      input$cohort_top_n,
-      input$cohort_min_clients,
-      input$cohort_label_chars,
-      input$sankey_start_node,
-      input$cohort_sankey_start_node
-    ),
-    {
-      req(cleaned_data())
-      
-      show_global_loader("Оновлюємо розрахунки...")
-      
-      session$onFlushed(function() {
-        hide_global_loader()
-      }, once = TRUE)
-    },
-    ignoreInit = TRUE
-  )
+  }, ignoreInit = TRUE)
   
   
   
