@@ -13,7 +13,7 @@ library(bslib)
 library(waiter)
 library(later)
 library(shinymanager)
-library(googledrive)
+
 
 
 options(shiny.maxRequestSize = 500 * 1024^2)
