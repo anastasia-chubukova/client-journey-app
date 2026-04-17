@@ -404,6 +404,10 @@ build_executive_kpis <- function(base_fact, replenishment_df = NULL) {
   }
   
   tx_tbl <- df2 %>%
+    filter(
+      !is.na(transaction_id), trimws(transaction_id) != "",
+      !is.na(transaction_date)
+    ) %>%
     distinct(client_id, transaction_id, transaction_date)
   
   transactions_n <- n_distinct(tx_tbl$transaction_id)
@@ -1314,15 +1318,18 @@ build_client_profile_tbl <- function(base_fact) {
     filter(!is.na(client_id), trimws(client_id) != "")
   
   tx_tbl <- df2 %>%
-    filter(!is.na(transaction_id), trimws(transaction_id) != "") %>%
+    filter(
+      !is.na(transaction_id), trimws(transaction_id) != "",
+      !is.na(transaction_date)
+    ) %>%
     distinct(client_id, transaction_id, transaction_date)
   
   base_tbl <- tx_tbl %>%
     group_by(client_id) %>%
     summarise(
       transactions_n = n_distinct(transaction_id),
-      first_tx_date = min(transaction_date, na.rm = TRUE),
-      last_tx_date = max(transaction_date, na.rm = TRUE),
+      first_tx_date = if (all(is.na(transaction_date))) as.Date(NA) else min(transaction_date, na.rm = TRUE),
+      last_tx_date  = if (all(is.na(transaction_date))) as.Date(NA) else max(transaction_date, na.rm = TRUE),
       .groups = "drop"
     )
   
@@ -1358,11 +1365,17 @@ build_selected_clients_kpi <- function(tbl) {
     ))
   }
   
+  last_activity <- if (!("last_tx_date" %in% names(tbl)) || all(is.na(tbl$last_tx_date))) {
+    NA_character_
+  } else {
+    as.character(max(tbl$last_tx_date, na.rm = TRUE))
+  }
+  
   tibble::tibble(
     Показник = c("Кількість клієнтів", "Остання активність"),
     Значення = c(
       n_distinct(tbl$client_id),
-      as.character(max(tbl$last_tx_date, na.rm = TRUE))
+      last_activity
     )
   )
 }
