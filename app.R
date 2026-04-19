@@ -163,19 +163,17 @@ safe_parse_numeric <- function(x) {
 }
 
 build_base_fact <- function(df, node_mode = "brand_category") {
-  sum_col <- detect_sum_column(df)
-  
   df %>%
     mutate(
       row_id_internal = row_number(),
       client_id = trimws(as.character(client_id)),
       transaction_id = trimws(as.character(transaction_id)),
       transaction_date_raw = as.character(transaction_date),
-      transaction_date = safe_parse_date(transaction_date),
+      transaction_date = transaction_date_parsed,
       brand = if ("brand" %in% names(.)) as.character(brand) else NA_character_,
       product_name = if ("product_name" %in% names(.)) as.character(product_name) else NA_character_,
-      sum_raw = if (!is.null(sum_col)) as.character(.data[[sum_col]]) else NA_character_,
-      item_sum_parsed = if (!is.null(sum_col)) safe_parse_numeric(.data[[sum_col]]) else NA_real_
+      sum_raw = if ("sum_raw" %in% names(.)) as.character(sum_raw) else NA_character_,
+      item_sum_parsed = if ("item_sum_parsed" %in% names(.)) item_sum_parsed else NA_real_
     ) %>%
     make_node(node_mode) %>%
     mutate(
@@ -1339,8 +1337,8 @@ build_client_profile_tbl <- function(base_fact) {
     money_tbl <- df2 %>%
       group_by(client_id) %>%
       summarise(
-        total_sum = round(sum(item_sum_parsed, na.rm = TRUE), 2),
-        avg_item_sum = round(mean(item_sum_parsed, na.rm = TRUE), 2),
+        total_sum = if (all(is.na(item_sum_parsed))) NA_real_ else round(sum(item_sum_parsed, na.rm = TRUE), 2),
+        avg_item_sum = if (all(is.na(item_sum_parsed))) NA_real_ else round(mean(item_sum_parsed, na.rm = TRUE), 2),
         .groups = "drop"
       )
     
@@ -2131,7 +2129,12 @@ ui <- secure_app(
           )
         ),
         
-        
+        actionButton(
+          "apply_analysis_params",
+          "Застосувати параметри",
+          class = "btn-primary",
+          width = "100%"
+        ),
         
         div(
           class = "info-card",
@@ -2523,9 +2526,11 @@ server <- function(input, output, session) {
   event_links_val <- reactiveVal(NULL)
   applied_cohort_filters <- reactiveVal(NULL)
   audit_data_val <- reactiveVal(NULL)
-  
+  cohort_data_val <- reactiveVal(NULL)
   replenishment_summary_val <- reactiveVal(NULL)
-  executive_kpis_val <- reactiveVal(NULL)
+
+  client_profile_tbl_val <- reactiveVal(NULL)
+  executive_kpis_static_val <- reactiveVal(NULL)
   
   output$current_user <- renderText({
     paste("Поточний користувач:", res_auth$user)
@@ -2533,14 +2538,6 @@ server <- function(input, output, session) {
   
   
   
-  raw_data <- reactive({
-    req(input$file)
-    df <- read_input_data(input$file$datapath)
-    validate(
-      need(nrow(df) > 0, "Файл порожній")
-    )
-    df
-  })
   
   cleaned_data <- reactive({
     req(cleaned_data_val())
@@ -2555,6 +2552,7 @@ server <- function(input, output, session) {
   lag_filter_stats <- reactive({
     req(event_links())
     
+    params <- applied_analysis_params()
     lnk <- event_links()
     
     total_with_next <- lnk %>%
@@ -2562,12 +2560,12 @@ server <- function(input, output, session) {
       nrow()
     
     below_min <- lnk %>%
-      filter(!is.na(next_step), !is.na(lag_days), lag_days < input$min_days) %>%
+      filter(!is.na(next_step), !is.na(lag_days), lag_days < params$min_days) %>%
       nrow()
     
-    above_max <- if (isTRUE(input$use_max_days)) {
+    above_max <- if (isTRUE(params$use_max_days)) {
       lnk %>%
-        filter(!is.na(next_step), !is.na(lag_days), lag_days > input$max_days) %>%
+        filter(!is.na(next_step), !is.na(lag_days), lag_days > params$max_days) %>%
         nrow()
     } else {
       0
@@ -2650,8 +2648,25 @@ server <- function(input, output, session) {
         transaction_id = trimws(as.character(transaction_id)),
         transaction_date = as.character(transaction_date),
         brand = as.character(brand),
-        product_name = as.character(product_name)
-      )
+        product_name = as.character(product_name),
+        transaction_date_parsed = safe_parse_date(transaction_date)
+      ) %>%
+      {
+        sum_col <- detect_sum_column(.)
+        if (!is.null(sum_col)) {
+          mutate(
+            .,
+            sum_raw = as.character(.data[[sum_col]]),
+            item_sum_parsed = safe_parse_numeric(.data[[sum_col]])
+          )
+        } else {
+          mutate(
+            .,
+            sum_raw = NA_character_,
+            item_sum_parsed = NA_real_
+          )
+        }
+      }
   }
   
   show_global_loader <- function(text = "Завантажуємо та обробляємо дані...") {
@@ -2692,11 +2707,21 @@ server <- function(input, output, session) {
     waiter_hide(id = id)
   }
   
+  applied_analysis_params <- reactiveVal(list(
+    node_mode = "brand_category",
+    basket_mode = "main_item",
+    min_days = 1,
+    use_max_days = FALSE,
+    max_days = 365
+  ))
+  
   rebuild_analysis <- function() {
     req(cleaned_data())
     
-    node_mode_val <- input$node_mode %||% "brand_category"
-    basket_mode_val <- input$basket_mode %||% "main_item"
+    params <- applied_analysis_params()
+    
+    node_mode_val <- params$node_mode %||% "brand_category"
+    basket_mode_val <- params$basket_mode %||% "main_item"
     
     df_clean <- cleaned_data()
     
@@ -2708,67 +2733,32 @@ server <- function(input, output, session) {
       basket_mode = basket_mode_val
     )
     
-    max_days_val <- if (isTRUE(input$use_max_days)) input$max_days else Inf
+    max_days_val <- if (isTRUE(params$use_max_days)) params$max_days else Inf
     
     lnk <- build_event_links(
       ev,
-      min_days = input$min_days %||% 1,
+      min_days = params$min_days %||% 1,
       max_days = max_days_val
     )
     
-    tr_raw <- lnk %>%
-      filter(next_valid) %>%
-      transmute(
-        client_id,
-        transaction_id,
-        transaction_date,
-        basket_nodes,
-        basket_label,
-        next_basket,
-        next_nodes,
-        next_date,
-        lag_days
-      )
-    
-    it <- build_item_transitions(
-      tr_raw,
-      keep_self_transitions = TRUE
-    )
-    
-    tr_sum <- summarise_item_transitions(it)
-    
     aud <- build_data_audit(base_fact_df)
     
-    # Повернення для таблиці "Повернення" — залежить від поточних фільтрів
+    # Повернення для таблиці "Повернення"
     repl <- build_replenishment(
       base_fact_df,
-      min_days = max(1, input$min_days %||% 1),
+      min_days = max(1, params$min_days %||% 1),
       max_days = max_days_val
     )
     
     repl_sum <- summarise_replenishment(repl)
     
-    # ОКРЕМО: стабільний розрахунок для KPI, як у старій версії
-    base_fact_kpi <- build_base_fact(df_clean, node_mode = "brand_category")
-    
-    repl_kpi <- build_replenishment(
-      base_fact_kpi,
-      min_days = 1,
-      max_days = 365
-    )
-    
-    executive_kpis_list <- build_executive_kpis(
-      base_fact = base_fact_kpi,
-      replenishment_df = repl_kpi
-    )
-    
     base_fact_val(base_fact_df)
+    client_profile_tbl_val(build_client_profile_tbl(base_fact_df))
     events_data_val(ev)
     event_links_val(lnk)
-    transitions_summary_val(tr_sum)
+    transitions_summary_val(NULL)   # бо зараз ці розрахунки не використовуються
     audit_data_val(aud)
     replenishment_summary_val(repl_sum)
-    executive_kpis_val(executive_kpis_list)
   }
   
   events_data <- reactive({
@@ -2800,7 +2790,8 @@ server <- function(input, output, session) {
   })
   
   cohort_data <- reactive({
-    build_cohort_table(cleaned_data())
+    req(cohort_data_val())
+    cohort_data_val()
   })
   
   cohort_kpis <- reactive({
@@ -2811,9 +2802,19 @@ server <- function(input, output, session) {
   
   
   filtered_cohort_sankey_choices <- reactive({
-    req(transitions_summary())
+    req(event_links())
     
-    all_nodes <- sort(unique(c(transitions_summary()$from, transitions_summary()$to)))
+    lnk <- event_links()
+    
+    all_nodes <- lnk %>%
+      filter(!is.na(next_step)) %>%
+      pull(basket_nodes) %>%
+      unlist() %>%
+      as.character() %>%
+      unique() %>%
+      sort()
+    
+    all_nodes <- all_nodes[!is.na(all_nodes) & trimws(all_nodes) != ""]
     
     search_txt <- input$cohort_sankey_search
     if (is.null(search_txt)) search_txt <- ""
@@ -2827,6 +2828,8 @@ server <- function(input, output, session) {
   })
   
   observe({
+    req(event_links_val())
+    
     choices <- filtered_cohort_sankey_choices()
     current_selected <- isolate(input$cohort_sankey_start_node)
     
@@ -2872,7 +2875,8 @@ server <- function(input, output, session) {
   })
   
   client_profile_tbl <- reactive({
-    build_client_profile_tbl(base_fact())
+    req(client_profile_tbl_val())
+    client_profile_tbl_val()
   })
   
   cohort_journey_long <- reactive({
@@ -2917,13 +2921,10 @@ server <- function(input, output, session) {
   
   
   observeEvent(
-    {
-      list(
-        input$cohort_depth,
-        input$cohort_sankey_start_node,
-        cohort_route_clients_for_filter()
-      )
-    },
+    list(
+      input$cohort_depth,
+      input$cohort_sankey_start_node
+    ),
     {
       req(!isTRUE(updating_filters()))
       
@@ -3009,8 +3010,8 @@ server <- function(input, output, session) {
   })
   
   executive_kpis <- reactive({
-    req(executive_kpis_val())
-    executive_kpis_val()
+    req(executive_kpis_static_val())
+    executive_kpis_static_val()
   })
   
   output$cohort_dynamic_step_filters <- renderUI({
@@ -4019,66 +4020,142 @@ server <- function(input, output, session) {
     )
   })
   
+  
+  
   observeEvent(
     list(
       input$node_mode,
       input$basket_mode,
       input$min_days,
       input$use_max_days,
-      input$max_days
+      input$max_days,
+      input$cohort_sankey_start_node,
+      input$cohort_depth
     ),
     {
-      rebuild_analysis()
-    }
+      applied_cohort_filters(NULL)
+    },
+    ignoreInit = TRUE
   )
-  
-  
   
   observeEvent(input$file, {
     req(input$file)
     
+    if (isTRUE(is_global_loading())) {
+      return()
+    }
+    
+    is_global_loading(TRUE)
     show_global_loader("Завантажуємо та обробляємо файл...")
     
-    tryCatch({
-      file_path <- input$file$datapath
-      
-      df_raw <- read_input_data(file_path)
-      
-      validate(
-        need(nrow(df_raw) > 0, "Файл порожній")
-      )
-      
-      df_clean <- prepare_cleaned_data(df_raw)
-      
-      loaded_data(df_raw)
-      cleaned_data_val(df_clean)
-      
-      rebuild_analysis()
-      
-      session$onFlushed(function() {
+    
+      tryCatch({
+        file_path <- input$file$datapath
+        
+        df_raw <- read_input_data(file_path)
+        
+        if (is.null(df_raw) || nrow(df_raw) == 0) {
+          stop("Файл порожній")
+        }
+        
+        df_clean <- prepare_cleaned_data(df_raw)
+        
+        base_fact_kpi <- build_base_fact(df_clean, node_mode = "brand_category")
+        repl_kpi <- build_replenishment(base_fact_kpi, min_days = 1, max_days = 365)
+        
+        executive_kpis_static_val(
+          build_executive_kpis(
+            base_fact = base_fact_kpi,
+            replenishment_df = repl_kpi
+          )
+        )
+        
+        loaded_data(df_raw)
+        cleaned_data_val(df_clean)
+        cohort_data_val(build_cohort_table(df_clean))
+        
+        applied_analysis_params(list(
+          node_mode = input$node_mode %||% "brand_category",
+          basket_mode = input$basket_mode %||% "main_item",
+          min_days = input$min_days %||% 1,
+          use_max_days = isTRUE(input$use_max_days),
+          max_days = input$max_days %||% 365
+        ))
+        
+        rebuild_analysis()
+        
+      }, error = function(e) {
+        loaded_data(NULL)
+        cleaned_data_val(NULL)
+        events_data_val(NULL)
+        event_links_val(NULL)
+        transitions_summary_val(NULL)
+        audit_data_val(NULL)
+        replenishment_summary_val(NULL)
+        
+        showNotification(
+          paste("Помилка завантаження:", conditionMessage(e)),
+          type = "error",
+          duration = NULL
+        )
+      }, finally = {
         hide_global_loader()
-      }, once = TRUE)
-      
+        is_global_loading(FALSE)
+      })
+ 
+    
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$apply_analysis_params, {
+    req(cleaned_data_val())
+    
+    if (isTRUE(is_global_loading())) {
+      return()
+    }
+    
+    is_global_loading(TRUE)
+    
+    applied_analysis_params(list(
+      node_mode = input$node_mode %||% "brand_category",
+      basket_mode = input$basket_mode %||% "main_item",
+      min_days = input$min_days %||% 1,
+      use_max_days = isTRUE(input$use_max_days),
+      max_days = input$max_days %||% 365
+    ))
+    
+    if (!is.null(input$cohort_depth) && input$cohort_depth > 0) {
+      for (i in seq_len(input$cohort_depth)) {
+        input_id <- paste0("cohort_step_pick_", i)
+        freezeReactiveValue(input, input_id)
+        updateSelectizeInput(
+          session,
+          inputId = input_id,
+          choices = c("Усі вузли" = all_nodes_choice),
+          selected = all_nodes_choice,
+          server = TRUE
+        )
+      }
+    }
+    
+    applied_cohort_filters(NULL)
+    
+    show_global_loader("Оновлюємо результати за новими параметрами...")
+    
+    tryCatch({
+      rebuild_analysis()
     }, error = function(e) {
-      loaded_data(NULL)
-      cleaned_data_val(NULL)
-      events_data_val(NULL)
-      event_links_val(NULL)
-      transitions_summary_val(NULL)
-      audit_data_val(NULL)
-      replenishment_summary_val(NULL)
-      
-      hide_global_loader()
-      
       showNotification(
-        paste("Помилка завантаження:", conditionMessage(e)),
+        paste("Помилка перебудови аналізу:", conditionMessage(e)),
         type = "error",
         duration = NULL
       )
+    }, finally = {
+      hide_global_loader()
+      is_global_loading(FALSE)
     })
+
+    
   }, ignoreInit = TRUE)
-  
-  
   
   
 }
