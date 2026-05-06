@@ -1572,7 +1572,7 @@ build_client_profile_tbl <- function(base_fact) {
     money_tbl <- df2 %>%
       group_by(client_id) %>%
       summarise(
-        total_sum = if (all(is.na(item_sum_parsed))) NA_real_ else round(sum(item_sum_parsed, na.rm = TRUE), 2),
+        total_sum = if (all(is.na(item_sum_parsed))) NA_real_ else round(sum(item_sum_parsed, na.rm = TRUE), 0),
         avg_item_sum = if (all(is.na(item_sum_parsed))) NA_real_ else round(mean(item_sum_parsed, na.rm = TRUE), 2),
         .groups = "drop"
       )
@@ -2452,6 +2452,20 @@ ui <- secure_app(
             div(
               class = "table-card",
               DTOutput("cohort_sankey_kpi_tbl")),
+            br(),
+            h4("Активність клієнтів"),
+            div(
+              class = "table-card",
+              id = "cohort_start_node_activity_summary_tbl_block",
+              DTOutput("cohort_start_node_activity_summary_tbl")
+            ),
+            br(),
+            div(
+              id = "cohort_behavior_after_start_tbl_block",
+              class = "table-card",
+              h4("Поведінка клієнтів після стартового вузла"),
+              DTOutput("cohort_behavior_after_start_tbl")
+            ),
             br(),
             htmlOutput("cohort_sankey_mode_text"),
             br(),
@@ -3631,12 +3645,12 @@ server <- function(input, output, session) {
     }
     
     tbl <- tbl %>%
-      select(-any_of(c("total_sum", "avg_item_sum")))
+      select(-any_of(c("avg_item_sum")))
     
     rename_map <- c(
       client_id = "Клієнт",
       route = "Маршрут",
-      route_depth = "Глибина маршруту",
+      
       L0 = "Крок 1",
       L1 = "Крок 2",
       L2 = "Крок 3",
@@ -3648,6 +3662,7 @@ server <- function(input, output, session) {
       L8 = "Крок 9",
       L10 = "Крок 10",
       transactions_n = "Усього транзакцій клієнта",
+      total_sum = "Сума виручки клієнта",
       first_tx_date = "Дата першої покупки",
       last_tx_date = "Дата останньої покупки"
     )
@@ -3724,20 +3739,25 @@ server <- function(input, output, session) {
       
       export_tbl <- cohort_selected_clients_tbl() %>%
         dplyr::select(-any_of(c(
-          "total_sum", "avg_item_sum", "route",
-          "transactions_n", "route_depth",
+          "avg_item_sum", "route",
+          "route_depth",
           "first_tx_date", "last_tx_date"
         )))
       
       rename_map <- c(
         client_id = "Клієнт",
+        transactions_n = "Кількість транзакцій клієнта",
+        total_sum = "Сума виручки клієнта",
         L0 = "Крок 1",
         L1 = "Крок 2",
         L2 = "Крок 3",
         L3 = "Крок 4",
         L4 = "Крок 5",
         L5 = "Крок 6",
-        L6 = "Крок 7"
+        L6 = "Крок 7",
+        L7 = "Крок 8",
+        L8 = "Крок 9",
+        L9 = "Крок 10"
       )
       
       existing_map <- rename_map[names(rename_map) %in% names(export_tbl)]
@@ -3821,6 +3841,7 @@ server <- function(input, output, session) {
     }
     out
   }
+  
   
   
   
@@ -4248,20 +4269,261 @@ server <- function(input, output, session) {
     )
     on.exit(hide_block_loader("audit_client_activity_summary_tbl_block"), add = TRUE)
     
-    req(audit_data())
+    req(audit_data(), base_fact())
     
     df <- audit_data()$client_activity_summary
+    base <- base_fact()
+    
+    client_money <- base %>%
+      filter(
+        !is.na(client_id), trimws(client_id) != "",
+        !is.na(transaction_id), trimws(transaction_id) != ""
+      ) %>%
+      group_by(client_id) %>%
+      summarise(
+        transactions_per_client = n_distinct(transaction_id),
+        total_client_sum = if (all(is.na(item_sum_parsed))) NA_real_ else sum(item_sum_parsed, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        Показник = case_when(
+          transactions_per_client == 1 ~ "Клієнтів з 1 транзакцією",
+          transactions_per_client == 2 ~ "Клієнтів з 2 транзакціями",
+          transactions_per_client >= 3 & transactions_per_client <= 4 ~ "Клієнтів з 3-4 транзакціями",
+          transactions_per_client >= 5 ~ "Клієнтів з 5+ транзакціями",
+          TRUE ~ NA_character_
+        )
+      )
+    
+    cohort_money <- client_money %>%
+      filter(!is.na(Показник)) %>%
+      group_by(Показник) %>%
+      summarise(
+        `Загальна сума покупок` = if (all(is.na(total_client_sum))) NA_real_ else round(sum(total_client_sum, na.rm = TRUE), 0),
+        `Середня сума покупок на клієнта` = round(mean(total_client_sum, na.rm = TRUE), 0),
+        .groups = "drop"
+      )
+    
+    df <- df %>%
+      left_join(cohort_money, by = "Показник")
+    
+    total_revenue_all <- sum(df$`Загальна сума покупок`, na.rm = TRUE)
+    
+    df <- df %>%
+      mutate(
+        `% виручки` = ifelse(
+          is.na(`Загальна сума покупок`),
+          NA,
+          round(100 * `Загальна сума покупок` / total_revenue_all, 1)
+        ),
+        `% виручки` = paste0(`% виручки`, "%")
+      )
     
     total_clients <- sum(df$Значення, na.rm = TRUE)
     
     df <- df %>%
+      rename(
+        `Кількість клієнтів` = Значення
+      ) %>%
       mutate(
-        `% клієнтів` = round(100 * Значення / total_clients, 1),
+        `% клієнтів` = round(100 * `Кількість клієнтів` / total_clients, 1),
         `% клієнтів` = paste0(`% клієнтів`, "%")
+      ) %>%
+      select(
+        Показник,
+        `Кількість клієнтів`,
+        `% клієнтів`,
+        `Загальна сума покупок`,
+        `% виручки`,
+        `Середня сума покупок на клієнта`
       )
     
     datatable(
       df,
+      options = list(dom = "t", scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+  
+  output$cohort_behavior_after_start_tbl <- renderDT({
+    
+    show_block_loader(
+      "cohort_behavior_after_start_tbl_block",
+      "Аналізуємо поведінку після стартового вузла..."
+    )
+    on.exit(hide_block_loader("cohort_behavior_after_start_tbl_block"), add = TRUE)
+    
+    req(cohort_route_clients_for_filter(), base_fact())
+    
+    routes <- cohort_route_clients_for_filter()
+    base <- base_fact()
+    
+    validate(
+      need(nrow(routes) > 0, "Немає даних для обраних параметрів")
+    )
+    
+    client_routes <- routes %>%
+      rowwise() %>%
+      mutate(
+        real_next_steps = sum(
+          !is.na(c_across(starts_with("L"))) &
+            c_across(starts_with("L")) != "Не повернулися"
+        ) - 1
+      ) %>%
+      ungroup() %>%
+      mutate(
+        real_next_steps = pmax(real_next_steps, 0)
+      ) %>%
+      select(client_id, real_next_steps) %>%
+      distinct()
+    
+    client_money <- base %>%
+      group_by(client_id) %>%
+      summarise(
+        total_client_sum = sum(item_sum_parsed, na.rm = TRUE),
+        .groups = "drop"
+      )
+    
+    df <- client_routes %>%
+      left_join(client_money, by = "client_id") %>%
+      mutate(
+        Показник = case_when(
+          real_next_steps == 0 ~ "Не повернулися після стартового вузла",
+          real_next_steps == 1 ~ "Зробили 1 наступний крок",
+          real_next_steps == 2 ~ "Зробили 2 наступні кроки",
+          real_next_steps >= 3 ~ "Зробили 3+ наступні кроки",
+          TRUE ~ "Інше"
+        )
+      )
+    
+    summary_tbl <- df %>%
+      group_by(Показник) %>%
+      summarise(
+        `Кількість клієнтів` = n_distinct(client_id),
+        `Загальна сума покупок` = round(sum(total_client_sum, na.rm = TRUE), 0),
+        `Середня сума покупок на клієнта` = round(mean(total_client_sum, na.rm = TRUE), 0),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        Показник = factor(
+          Показник,
+          levels = c(
+            "Не повернулися після стартового вузла",
+            "Зробили 1 наступний крок",
+            "Зробили 2 наступні кроки",
+            "Зробили 3+ наступні кроки"
+          )
+        )
+      ) %>%
+      arrange(Показник)
+    
+    total_clients <- sum(summary_tbl$`Кількість клієнтів`)
+    total_revenue <- sum(summary_tbl$`Загальна сума покупок`, na.rm = TRUE)
+    
+    summary_tbl <- summary_tbl %>%
+      mutate(
+        `% клієнтів` = paste0(round(100 * `Кількість клієнтів` / total_clients, 1), "%"),
+        `% виручки` = paste0(round(100 * `Загальна сума покупок` / total_revenue, 1), "%")
+      ) %>%
+      select(
+        Показник,
+        `Кількість клієнтів`,
+        `% клієнтів`,
+        `Загальна сума покупок`,
+        `% виручки`,
+        `Середня сума покупок на клієнта`
+      )
+    
+    datatable(
+      summary_tbl,
+      options = list(dom = "t", scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+  
+  output$cohort_start_node_activity_summary_tbl <- renderDT({
+    
+    show_block_loader(
+      "cohort_start_node_activity_summary_tbl_block",
+      "Аналізуємо активність клієнтів..."
+    )
+    on.exit(hide_block_loader("cohort_start_node_activity_summary_tbl_block"), add = TRUE)
+    
+    req(cohort_route_clients_for_filter(), base_fact())
+    
+    routes <- cohort_route_clients_for_filter()
+    base <- base_fact()
+    
+    validate(
+      need(nrow(routes) > 0, "Немає клієнтів для обраних параметрів")
+    )
+    
+    selected_clients <- routes %>%
+      distinct(client_id)
+    
+    client_money <- base %>%
+      semi_join(selected_clients, by = "client_id") %>%
+      filter(
+        !is.na(client_id), trimws(client_id) != "",
+        !is.na(transaction_id), trimws(transaction_id) != ""
+      ) %>%
+      group_by(client_id) %>%
+      summarise(
+        transactions_per_client = n_distinct(transaction_id),
+        total_client_sum = sum(item_sum_parsed, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        Показник = case_when(
+          transactions_per_client == 1 ~ "Клієнтів з 1 транзакцією",
+          transactions_per_client == 2 ~ "Клієнтів з 2 транзакціями",
+          transactions_per_client >= 3 & transactions_per_client <= 4 ~ "Клієнтів з 3-4 транзакціями",
+          transactions_per_client >= 5 ~ "Клієнтів з 5+ транзакціями",
+          TRUE ~ "Інше"
+        )
+      )
+    
+    summary_tbl <- client_money %>%
+      filter(!is.na(Показник)) %>%
+      group_by(Показник) %>%
+      summarise(
+        `Кількість клієнтів` = n_distinct(client_id),
+        `Загальна сума покупок` = round(sum(total_client_sum, na.rm = TRUE), 0),
+        `Середня сума покупок на клієнта` = round(mean(total_client_sum, na.rm = TRUE), 0),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        Показник = factor(
+          Показник,
+          levels = c(
+            "Клієнтів з 1 транзакцією",
+            "Клієнтів з 2 транзакціями",
+            "Клієнтів з 3-4 транзакціями",
+            "Клієнтів з 5+ транзакціями"
+          )
+        )
+      ) %>%
+      arrange(Показник)
+    
+    total_clients <- sum(summary_tbl$`Кількість клієнтів`, na.rm = TRUE)
+    total_revenue <- sum(summary_tbl$`Загальна сума покупок`, na.rm = TRUE)
+    
+    summary_tbl <- summary_tbl %>%
+      mutate(
+        `% клієнтів` = paste0(round(100 * `Кількість клієнтів` / total_clients, 1), "%"),
+        `% виручки` = paste0(round(100 * `Загальна сума покупок` / total_revenue, 1), "%")
+      ) %>%
+      select(
+        Показник,
+        `Кількість клієнтів`,
+        `% клієнтів`,
+        `Загальна сума покупок`,
+        `% виручки`,
+        `Середня сума покупок на клієнта`
+      )
+    
+    datatable(
+      summary_tbl,
       options = list(dom = "t", scrollX = TRUE),
       rownames = FALSE
     )
