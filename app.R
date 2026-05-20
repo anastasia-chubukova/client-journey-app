@@ -27,7 +27,7 @@ guess_delim <- function(path) {
 
 
 credentials <- data.frame(
-  user = c("client1", "client2", "admin"),
+  user = c("client1", "moyo", "admin"),
   password = c(
     Sys.getenv("CLIENT1_PASS"),
     Sys.getenv("CLIENT2_PASS"),
